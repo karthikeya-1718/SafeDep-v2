@@ -1,0 +1,7 @@
+# SafeDep Core runs with zero external runtime dependencies (Python >= 3.9)
+# Standard library modules used: ast, dataclasses, pathlib, argparse, json, sys, os
+
+# Development & Testing (Optional)
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
