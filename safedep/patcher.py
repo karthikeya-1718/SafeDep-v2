@@ -78,6 +78,7 @@ def propose_patch(
     old_signature = breaking_change_info.get("old_signature")
     new_signature = breaking_change_info.get("new_signature")
     code_context = str(breaking_change_info.get("code_context", ""))
+    feedback = str(breaking_change_info.get("feedback", "")).strip()
 
     return _patch_with_deepseek(
         call_expression=code_snippet,
@@ -85,6 +86,7 @@ def propose_patch(
         old_signature=old_signature,
         new_signature=new_signature,
         code_context=code_context,
+        feedback=feedback,
         api_key=api_key,
         model=model,
     )
@@ -95,55 +97,190 @@ def propose_patch(
 # ---------------------------------------------------------------------------
 
 
+def _clean_llm_code_response(text: str) -> str:
+    """Clean the raw LLM response text, stripping markdown and explanatory prefixes."""
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    # Check for markdown code fences: ```python ... ``` or ``` ... ```
+    fence_match = re.search(r"```(?:python)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+    else:
+        # Strip leading ```python or ``` and trailing ```
+        cleaned = re.sub(r"^```(?:python)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+    # If single-line wrapped in backticks: `expr`
+    if cleaned.startswith("`") and cleaned.endswith("`") and cleaned.count("`") == 2:
+        cleaned = cleaned[1:-1].strip()
+
+    # Strip conversational prefixes if the LLM output something like:
+    # "Replacement: foo(bar)" or "Fixed code: foo(bar)"
+    prefix_patterns = [
+        r"^(?:here\s+is\s+(?:the\s+)?(?:fixed\s+code|fix|replacement|patch):?)\s*",
+        r"^(?:replacement|fixed\s+code|patch|fix):\s*",
+    ]
+    for pattern in prefix_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+
+    return cleaned
+
+
+def _is_valid_python_code(code: str, original_code: str = "") -> bool:
+    """Validate that code string is syntactically valid Python and not an English explanation."""
+    if not code or not code.strip():
+        return False
+    try:
+        parsed = ast.parse(code.strip())
+        # An empty AST (e.g. only comments or blank) is not executable replacement code
+        if not parsed.body:
+            return False
+        # If the AST is just a single string literal (e.g. "This function was removed"),
+        # treat it as English text unless the original was also a string literal.
+        if (
+            len(parsed.body) == 1
+            and isinstance(parsed.body[0], ast.Expr)
+            and isinstance(parsed.body[0].value, ast.Constant)
+            and isinstance(parsed.body[0].value.value, str)
+        ):
+            if original_code and original_code.strip():
+                try:
+                    orig_parsed = ast.parse(original_code.strip())
+                    if (
+                        len(orig_parsed.body) == 1
+                        and isinstance(orig_parsed.body[0], ast.Expr)
+                        and isinstance(orig_parsed.body[0].value, ast.Constant)
+                        and isinstance(orig_parsed.body[0].value.value, str)
+                    ):
+                        return True
+                except Exception:
+                    pass
+            return False
+        return True
+    except SyntaxError:
+        return False
+
+
 def _patch_with_deepseek(
     call_expression: str,
     breaking_change: str,
     old_signature: Optional[str] = None,
     new_signature: Optional[str] = None,
     code_context: str = "",
+    feedback: str = "",
     api_key: Optional[str] = None,
     model: str = "deepseek-chat",
 ) -> str:
-    """Request a signature refactoring patch from the DeepSeek API.
+    """Request a signature refactoring patch from the LLM (Groq or DeepSeek API).
 
-    Uses the OpenAI-compatible DeepSeek chat completions endpoint.
-    Falls back to :func:`_ast_fallback_patch` on any error.
+    Uses an OpenAI-compatible chat completions endpoint with strict formatting
+    instructions to ensure valid Python code output and prevent natural language
+    responses. Falls back to :func:`_ast_fallback_patch` on any error or invalid
+    syntax.
     """
-    effective_api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+    effective_api_key = (
+        api_key
+        or os.environ.get("GROQ_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY")
+    )
 
     if effective_api_key:
         try:
-            prompt = (
-                "You are SafeDep's automated Python refactoring engine.\n"
-                f"Issue / Breaking Change: {breaking_change}\n\n"
-                f"Original Call Expression / Statement: {call_expression}\n"
-                f"Old Signature: {old_signature or 'N/A'}\n"
-                f"New Signature: {new_signature or 'N/A'}\n"
-            )
-            if code_context:
-                prompt += f"\nCode Context:\n```python\n{code_context}\n```\n"
+            # Determine LLM provider: Groq (preferred) vs DeepSeek
+            is_groq = False
+            if effective_api_key.startswith("gsk_") or (
+                not api_key and os.environ.get("GROQ_API_KEY") == effective_api_key
+            ):
+                is_groq = True
+            elif any(k in model.lower() for k in ("llama", "mixtral", "gemma", "groq")):
+                is_groq = True
 
-            prompt += (
-                "\nProvide ONLY the replacement Python line / expression that fixes the issue.\n"
-                "Return only the single fixed Python expression/statement, with no markdown code blocks or explanations."
+            if is_groq:
+                url = "https://api.groq.com/openai/v1/chat/completions"
+                effective_model = (
+                    "llama-3.3-70b-versatile" if model == "deepseek-chat" else model
+                )
+            else:
+                url = "https://api.deepseek.com/chat/completions"
+                effective_model = model
+
+            system_prompt = (
+                "You are SafeDep's automated Python refactoring engine.\n"
+                "Your role is to patch broken Python call sites caused by library upgrades and API breaking changes.\n\n"
+                "STRICT RULES:\n"
+                "1. Output ONLY valid, executable Python code.\n"
+                "2. Return ONLY the replacement code snippet (an expression or statement) that directly replaces the original code snippet.\n"
+                "3. Do NOT include markdown commentary, conversational text, descriptions, or explanations.\n"
+                "4. Do NOT add comments or explanations unless strictly necessary for Python syntax.\n"
+                "5. NEVER return English sentences (such as 'This function was removed' or 'Manual intervention required') as code.\n"
+                "6. If the breaking change cannot be fixed automatically or requires manual intervention, output the original snippet unchanged."
             )
+
+            prompt_sections = [
+                "### TASK: Automated Python Code Repair",
+                "Fix the broken Python code snippet below to resolve the specified API breaking change.",
+                "",
+                "### EXACT BREAKING CHANGE INFORMATION:",
+                f"- Issue: {breaking_change.strip()}",
+            ]
+            if old_signature:
+                prompt_sections.append(f"- Old Signature: {old_signature.strip()}")
+            if new_signature:
+                prompt_sections.append(f"- New Signature: {new_signature.strip()}")
+
+            prompt_sections.extend([
+                "",
+                "### ORIGINAL CODE SNIPPET TO FIX:",
+                "```python",
+                call_expression.strip(),
+                "```",
+            ])
+
+            if code_context and code_context.strip():
+                prompt_sections.extend([
+                    "",
+                    "### SURROUNDING CODE CONTEXT:",
+                    "```python",
+                    code_context.strip(),
+                    "```",
+                ])
+
+            if feedback and feedback.strip():
+                prompt_sections.extend([
+                    "",
+                    "### TEST FEEDBACK FROM PREVIOUS ATTEMPT:",
+                    f"- Error details: {feedback.strip()}",
+                    "- Please refine your replacement code to resolve this error and ensure tests pass.",
+                ])
+
+            prompt_sections.extend([
+                "",
+                "### STRICT INSTRUCTIONS FOR CODE GENERATION:",
+                "1. Return ONLY the replacement Python code that directly replaces the original snippet.",
+                "2. The returned code MUST be syntactically valid Python.",
+                "3. Do NOT add any explanations, introductory text, markdown commentary, or notes.",
+                "4. Do NOT add comments unless strictly necessary for Python syntax.",
+                "5. NEVER return English sentences or advice as code. If you cannot produce a valid Python code fix, output the original snippet unchanged.",
+                "6. Output ONLY the raw replacement Python code without markdown code blocks unless necessary.",
+                "",
+                "Replacement Code:"
+            ])
+            user_prompt = "\n".join(prompt_sections)
 
             req_payload = {
-                "model": model,
+                "model": effective_model,
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "You are an automated Python refactoring tool. "
-                            "Output ONLY the corrected single line Python call expression or statement."
-                        ),
+                        "content": system_prompt,
                     },
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0.0,
             }
 
-            url = "https://api.deepseek.com/chat/completions"
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {effective_api_key}",
@@ -158,14 +295,11 @@ def _patch_with_deepseek(
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp_json = json.loads(resp.read().decode("utf-8"))
                 result_text = resp_json["choices"][0]["message"]["content"].strip()
-                # Strip any markdown fences the model may have included
-                result_text = re.sub(r"^```python\s*", "", result_text)
-                result_text = re.sub(r"^```\s*", "", result_text)
-                result_text = re.sub(r"```$", "", result_text).strip()
-                if result_text:
-                    return result_text
+                cleaned_result = _clean_llm_code_response(result_text)
+                if cleaned_result and _is_valid_python_code(cleaned_result, original_code=call_expression):
+                    return cleaned_result
         except Exception:
-            # Network or API error — fall through to the AST engine
+            # Network, API error, or invalid code — fall through to the AST engine
             pass
 
     return _ast_fallback_patch(

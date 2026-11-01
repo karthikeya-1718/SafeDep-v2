@@ -117,7 +117,7 @@ class TestProposePatch(unittest.TestCase):
         """propose_patch correctly bundles code_context into the DeepSeek payload."""
         captured: dict = {}
 
-        def fake_deepseek(call_expression, breaking_change, old_signature, new_signature, code_context, api_key, model):
+        def fake_deepseek(call_expression, breaking_change, old_signature, new_signature, code_context, api_key, model, feedback=None, **kwargs):
             captured["code_context"] = code_context
             return call_expression  # echo unchanged
 
@@ -131,6 +131,25 @@ class TestProposePatch(unittest.TestCase):
             )
 
         self.assertIn("def bar", captured["code_context"])
+
+    def test_passes_feedback_to_deepseek(self):
+        """propose_patch forwards feedback from breaking_change_info into DeepSeek."""
+        captured: dict = {}
+
+        def fake_deepseek(call_expression, breaking_change, old_signature, new_signature, code_context, api_key, model, feedback=None, **kwargs):
+            captured["feedback"] = feedback
+            return call_expression
+
+        with patch("safedep.patcher._patch_with_deepseek", side_effect=fake_deepseek):
+            propose_patch(
+                code_snippet="foo()",
+                breaking_change_info={
+                    "breaking_change": "x",
+                    "feedback": "FAILED: assert False == True",
+                },
+            )
+
+        self.assertEqual(captured.get("feedback"), "FAILED: assert False == True")
 
     def test_returns_deepseek_result_when_api_key_present(self):
         """When the API responds, propose_patch returns that result."""
@@ -180,6 +199,123 @@ class TestProposePatch(unittest.TestCase):
             )
 
         self.assertEqual(result, "fixed()")
+
+    def test_rejects_english_sentence_and_falls_back_to_ast(self):
+        """propose_patch rejects English sentences as code and falls back to AST engine."""
+        mock_resp_data = b'{"choices": [{"message": {"content": "The function fetch_user was removed in version 2.0."}}]}'
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = mock_resp_data
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            result = propose_patch(
+                code_snippet="query(sql, timeout=5)",
+                breaking_change_info={"breaking_change": "Parameter 'timeout' was removed"},
+                api_key="fake-key",
+            )
+
+        # Falls back to AST engine which successfully strips timeout
+        self.assertEqual(result, "query(sql)")
+
+    def test_rejects_quoted_english_sentence_and_falls_back_to_ast(self):
+        """propose_patch rejects quoted English text returned as code."""
+        mock_resp_data = b'{"choices": [{"message": {"content": "\\"Manual intervention required for removed function\\""}}]}'
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = mock_resp_data
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            result = propose_patch(
+                code_snippet="query(sql, timeout=5)",
+                breaking_change_info={"breaking_change": "Parameter 'timeout' was removed"},
+                api_key="fake-key",
+            )
+
+        self.assertEqual(result, "query(sql)")
+
+    def test_cleans_conversational_prefix_from_llm(self):
+        """propose_patch cleans 'Replacement:' or 'Here is the fix:' prefixes from LLM."""
+        mock_resp_data = b'{"choices": [{"message": {"content": "Replacement: query(sql)"}}]}'
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = mock_resp_data
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            result = propose_patch(
+                code_snippet="query(sql, timeout=5)",
+                breaking_change_info={"breaking_change": "Parameter 'timeout' was removed"},
+                api_key="fake-key",
+            )
+
+        self.assertEqual(result, "query(sql)")
+
+    def test_prompt_includes_required_sections_and_constraints(self):
+        """propose_patch sends a prompt containing snippet, breaking info, and strict constraints."""
+        captured_payload: dict = {}
+
+        def fake_urlopen(req, timeout=15):
+            nonlocal captured_payload
+            import json
+            captured_payload = json.loads(req.data.decode("utf-8"))
+            resp = MagicMock()
+            resp.read.return_value = b'{"choices": [{"message": {"content": "fixed()"}}]}'
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            propose_patch(
+                code_snippet="fetch(user_id, timeout=10)",
+                breaking_change_info={
+                    "breaking_change": "Parameter 'timeout' was removed",
+                    "old_signature": "def fetch(user_id, timeout=10)",
+                    "new_signature": "def fetch(user_id)",
+                },
+                api_key="fake-key",
+            )
+
+        user_content = captured_payload["messages"][1]["content"]
+        system_content = captured_payload["messages"][0]["content"]
+
+        # Verify original code snippet is included
+        self.assertIn("fetch(user_id, timeout=10)", user_content)
+        # Verify exact breaking change information is included
+        self.assertIn("Parameter 'timeout' was removed", user_content)
+        self.assertIn("def fetch(user_id, timeout=10)", user_content)
+        self.assertIn("def fetch(user_id)", user_content)
+        # Verify instructions: valid python code, no explanations/comments, no English sentences
+        self.assertIn("valid Python", user_content)
+        self.assertIn("explanations", user_content)
+        self.assertIn("English sentences", user_content)
+        self.assertIn("valid, executable Python code", system_content)
+
+    def test_routes_to_groq_when_gsk_api_key_used(self):
+        """propose_patch uses Groq endpoint when api_key starts with gsk_."""
+        captured_req = None
+
+        def fake_urlopen(req, timeout=15):
+            nonlocal captured_req
+            captured_req = req
+            resp = MagicMock()
+            resp.read.return_value = b'{"choices": [{"message": {"content": "fixed()"}}]}'
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            propose_patch(
+                code_snippet="fetch()",
+                breaking_change_info={"breaking_change": "x"},
+                api_key="gsk_test1234567890",
+            )
+
+        self.assertIn("api.groq.com", captured_req.full_url)
 
 
 class TestBackwardsCompatShims(unittest.TestCase):

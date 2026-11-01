@@ -18,6 +18,7 @@ Behavioral issues are explicitly deferred to post-installation testing.
 
 from __future__ import annotations
 
+import ast
 import difflib
 import shutil
 import subprocess
@@ -30,6 +31,33 @@ from .api_diff import get_breaking_changes
 from .call_graph import get_affected_call_sites
 from .patcher import propose_patch
 from .risk_ranker import rank_affected_call_sites
+
+
+def _is_valid_replacement_code(replacement: str) -> bool:
+    """Check if proposed replacement string is valid executable Python code and not text."""
+    if not replacement or not replacement.strip():
+        return False
+    text = replacement.strip()
+    # Check for manual intervention markers or explanatory guidance text
+    if any(marker in text.lower() for marker in (
+        "manual intervention", "no longer exists", "was removed", "remove this call", "replace with"
+    )):
+        return False
+    try:
+        parsed = ast.parse(text)
+        if not parsed.body:
+            return False
+        # Reject lone string literals (docstrings or English explanations in quotes)
+        if (
+            len(parsed.body) == 1
+            and isinstance(parsed.body[0], ast.Expr)
+            and isinstance(parsed.body[0].value, ast.Constant)
+            and isinstance(parsed.body[0].value.value, str)
+        ):
+            return False
+        return True
+    except SyntaxError:
+        return False
 
 
 @dataclass
@@ -50,6 +78,8 @@ class RepairIssue:
     proposed_fix: Optional[str] = None
     patch_diff: Optional[str] = None
     explanation: str = ""
+    is_removal: bool = False
+    manual_intervention_required: bool = False
 
 
 @dataclass
@@ -65,12 +95,24 @@ class PreInstallRepairReport:
     unified_diffs: dict[str, str] = field(default_factory=dict)  # file_path -> unified diff text
     applied: bool = False
     installed: bool = False
+    manual_intervention_count: int = 0
+
+    @property
+    def auto_fixable_issues(self) -> list[RepairIssue]:
+        """Syntactical signature issues that can be automatically patched safely."""
+        return [i for i in self.syntactical_issues if not i.is_removal and not i.manual_intervention_required]
+
+    @property
+    def manual_intervention_issues(self) -> list[RepairIssue]:
+        """Issues involving removed symbols or breaking changes requiring manual intervention."""
+        return [i for i in self.syntactical_issues if i.is_removal or i.manual_intervention_required]
 
     def to_dict(self) -> dict[str, Any]:
         """Convert report to dictionary format."""
         return {
             "total_issues": self.total_issues,
-            "syntactical_issues_fixable_now": self.syntactical_count,
+            "syntactical_issues_fixable_now": len(self.auto_fixable_issues),
+            "manual_intervention_required": len(self.manual_intervention_issues),
             "behavioral_issues_deferred": self.behavioral_count,
             "syntactical_issues": [
                 {
@@ -84,6 +126,8 @@ class PreInstallRepairReport:
                     "call_expression": i.call_expression,
                     "proposed_fix": i.proposed_fix,
                     "patch_diff": i.patch_diff,
+                    "is_removal": i.is_removal,
+                    "manual_intervention_required": i.manual_intervention_required,
                 }
                 for i in self.syntactical_issues
             ],
@@ -229,14 +273,25 @@ def analyze_pre_install_issues(
       - Fixable syntactical/signature changes (generates patches via DeepSeek)
       - Deferred behavioral issues (noted for post-installation runtime verification)
     """
+    # 0. Validate input paths
+    old_p = Path(old_path)
+    new_p = Path(new_path)
+    client_p = Path(client_path)
+    if not old_p.exists():
+        raise FileNotFoundError(f"Original library path does not exist: '{old_path}'")
+    if not new_p.exists():
+        raise FileNotFoundError(f"New library path does not exist: '{new_path}'")
+    if not client_p.exists():
+        raise FileNotFoundError(f"Client codebase path does not exist: '{client_path}'")
+
     # 1. Run api_diff to find breaking changes in the library
-    diff_result = get_breaking_changes(old_path, new_path)
+    diff_result = get_breaking_changes(old_p, new_p)
 
     # 2. Run call_graph to find affected call sites in the client project
-    raw_call_sites = get_affected_call_sites(client_path, diff_result)
+    raw_call_sites = get_affected_call_sites(client_p, diff_result)
 
     # 3. Run risk_ranker to assign risk scores and sort by impact
-    ranked_call_sites = rank_affected_call_sites(raw_call_sites, project_path=client_path)
+    ranked_call_sites = rank_affected_call_sites(raw_call_sites, project_path=client_p)
 
     syntactical_issues: list[RepairIssue] = []
     behavioral_issues: list[RepairIssue] = []
@@ -277,20 +332,28 @@ def analyze_pre_install_issues(
                 breaking = f"{breaking} ({reasons_str})"
 
         if issue_type == "syntactical":
-            # Determine whether this is a removal vs. a signature change.
-            # Removed symbols cannot be patched to a valid call — provide a
-            # descriptive guidance message instead of generating a code patch.
+            # Determine whether this is a removed symbol vs. an auto-fixable signature change.
+            # Removed symbols (functions, classes, methods) CANNOT be safely auto-patched;
+            # they must be flagged as "Manual Intervention Required".
             is_removal = (
-                any(fn.get("name") == callee for fn in diff_result.get("removed_functions", []))
-                or any(cls.get("name") == callee for cls in diff_result.get("removed_classes", []))
+                any(fn.get("name") == callee or callee.endswith("." + str(fn.get("name", ""))) for fn in diff_result.get("removed_functions", []))
+                or any(cls.get("name") == callee or callee.endswith("." + str(cls.get("name", ""))) for cls in diff_result.get("removed_classes", []))
                 or any(
                     callee in (m.get("method_name", ""), f"{m.get('class_name','')}.{m.get('method_name','')}")
+                    or callee.endswith("." + str(m.get("method_name", "")))
                     for m in diff_result.get("removed_methods", [])
+                )
+                or (
+                    any(phrase in breaking.lower() for phrase in ("function was removed", "method was removed", "class was removed", "was removed"))
+                    and not any(param_kw in breaking.lower() for param_kw in ("parameter", "argument", "default value", "param"))
                 )
             )
 
             if is_removal:
-                proposed_fix = f"Remove this call or replace with an alternative (`{callee}` no longer exists in new version)"
+                proposed_fix = (
+                    f"Manual Intervention Required (`{callee}` was removed and no longer exists in new version)"
+                )
+                patch_diff = ""
             else:
                 # Extract surrounding context if file exists
                 lines = get_lines(fp)
@@ -300,7 +363,7 @@ def analyze_pre_install_issues(
                     end = min(len(lines), line_no + 3)
                     ctx = "".join(lines[start:end])
 
-                # Generate fix via patcher (DeepSeek API with AST fallback)
+                # Generate fix via patcher (Groq/DeepSeek API with AST fallback)
                 proposed_fix = propose_patch(
                     code_snippet=expr,
                     breaking_change_info={
@@ -313,10 +376,13 @@ def analyze_pre_install_issues(
                     model=deepseek_model,
                 )
 
-            # Generate unified diff preview
-            patch_diff = ""
-            if expr and proposed_fix and expr != proposed_fix:
-                patch_diff = f"- {expr}\n+ {proposed_fix}"
+                # Generate unified diff preview
+                patch_diff = ""
+                if expr and proposed_fix and expr != proposed_fix and _is_valid_replacement_code(proposed_fix):
+                    patch_diff = f"- {expr}\n+ {proposed_fix}"
+                elif proposed_fix and not _is_valid_replacement_code(proposed_fix):
+                    # If invalid or explanation returned, revert to expr (no patch)
+                    proposed_fix = expr
 
             syntactical_issues.append(
                 RepairIssue(
@@ -333,6 +399,8 @@ def analyze_pre_install_issues(
                     new_signature=new_sig,
                     proposed_fix=proposed_fix,
                     patch_diff=patch_diff,
+                    is_removal=is_removal,
+                    manual_intervention_required=is_removal,
                 )
             )
         else:
@@ -376,8 +444,17 @@ def analyze_pre_install_issues(
         # Sort issues by line number in reverse order to avoid line shifting
         sorted_issues = sorted(issues, key=lambda x: x.line_number, reverse=True)
         for iss in sorted_issues:
+            # Exclude removed symbols or issues requiring manual intervention
+            if iss.is_removal or iss.manual_intervention_required:
+                continue
             if not iss.proposed_fix or not iss.call_expression:
                 continue
+            # Ensure proposed fix is valid code, not English or unchanged
+            if not _is_valid_replacement_code(iss.proposed_fix):
+                continue
+            if iss.proposed_fix == iss.call_expression:
+                continue
+
             idx = iss.line_number - 1
             if 0 <= idx < len(file_lines):
                 old_line = file_lines[idx]
@@ -388,19 +465,26 @@ def analyze_pre_install_issues(
 
         if modified:
             new_text = "".join(file_lines)
-            patched_files[file_path] = new_text
+            # Verify that patched content parses as valid Python
+            try:
+                ast.parse(new_text)
+                patched_files[file_path] = new_text
 
-            # Compute unified diff
-            diff = difflib.unified_diff(
-                original_text.splitlines(),
-                new_text.splitlines(),
-                fromfile=f"a/{Path(file_path).name}",
-                tofile=f"b/{Path(file_path).name}",
-                lineterm="",
-            )
-            unified_diffs[file_path] = "\n".join(diff)
+                # Compute unified diff
+                diff = difflib.unified_diff(
+                    original_text.splitlines(),
+                    new_text.splitlines(),
+                    fromfile=f"a/{Path(file_path).name}",
+                    tofile=f"b/{Path(file_path).name}",
+                    lineterm="",
+                )
+                unified_diffs[file_path] = "\n".join(diff)
+            except SyntaxError:
+                # Patch generated invalid syntax - safely discard to prevent breaking code
+                pass
 
     total_issues = len(syntactical_issues) + len(behavioral_issues)
+    manual_count = sum(1 for iss in syntactical_issues if iss.is_removal or iss.manual_intervention_required)
 
     return PreInstallRepairReport(
         total_issues=total_issues,
@@ -410,13 +494,24 @@ def analyze_pre_install_issues(
         behavioral_issues=behavioral_issues,
         patched_files=patched_files,
         unified_diffs=unified_diffs,
+        manual_intervention_count=manual_count,
     )
 
 
 def format_pre_install_report(report: PreInstallRepairReport) -> str:
-    """Produce the clear terminal Pre-Install Repair report."""
+    """Produce the clear terminal Pre-Install Repair report.
+
+    Clearly separates:
+    1. Auto-fixable signature changes (applied pre-installation)
+    2. Removed functions / symbols (manual intervention required)
+    3. Behavioral / structural issues (deferred to post-installation test verification)
+    """
     border = "=" * 70
     sub_border = "-" * 70
+
+    auto_fixable = report.auto_fixable_issues
+    removals = report.manual_intervention_issues
+    behavioral = report.behavioral_issues
 
     lines = [
         border,
@@ -424,7 +519,8 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
         border,
         "SUMMARY:",
         f"  * Total issues found:                                 {report.total_issues}",
-        f"  * Syntactical / signature issues (fixable now):       {report.syntactical_count}",
+        f"  * Syntactical / signature issues (fixable now):       {len(auto_fixable)}",
+        f"  * Removed functions (manual intervention):            {len(removals)}",
         f"  * Behavioral / structural issues (deferred):          {report.behavioral_count}",
         sub_border,
         "IMPORTANT NOTE ON BEHAVIORAL ISSUES:",
@@ -436,11 +532,11 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
         sub_border,
     ]
 
-    # Section 1: Fixable Syntactical Issues
-    if report.syntactical_issues:
-        lines.append(f"\n[+] FIXABLE SYNTACTICAL / SIGNATURE-LEVEL ISSUES ({report.syntactical_count}):")
-        lines.append("    (Patches generated via DeepSeek / AST Refactoring Engine)\n")
-        for idx, iss in enumerate(report.syntactical_issues, 1):
+    # Section 1: Auto-Fixable Signature Changes
+    if auto_fixable:
+        lines.append(f"\n[+] AUTO-FIXABLE SIGNATURE CHANGES ({len(auto_fixable)}):")
+        lines.append("    (Patches generated via Groq / DeepSeek / AST Refactoring Engine)\n")
+        for idx, iss in enumerate(auto_fixable, 1):
             fname = Path(iss.file_path).name
             lines.append(f"  {idx}. [{iss.risk_level}] `{iss.function_name}` in {fname}:{iss.line_number}")
             lines.append(f"     Caller:       `{iss.caller_name}()`")
@@ -452,11 +548,25 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
                 lines.append(f"     Patch Diff:   {iss.patch_diff.replace(chr(10), ' | ')}")
             lines.append("")
 
-    # Section 2: Behavioral / Deferred Issues
-    if report.behavioral_issues:
-        lines.append(f"\n[!] BEHAVIORAL / STRUCTURAL ISSUES ({report.behavioral_count}):")
+    # Section 2: Removed Functions / Methods (Manual Intervention Required)
+    if removals:
+        lines.append(f"\n[!] REMOVED FUNCTIONS / SYMBOLS (MANUAL INTERVENTION REQUIRED) ({len(removals)}):")
+        lines.append("    (Removed symbols cannot be safely auto-patched; manual review required)\n")
+        for idx, iss in enumerate(removals, 1):
+            fname = Path(iss.file_path).name
+            lines.append(f"  {idx}. [{iss.risk_level}] `{iss.function_name}` in {fname}:{iss.line_number}")
+            lines.append(f"     Caller:       `{iss.caller_name}()`")
+            lines.append(f"     Issue:        {iss.breaking_change}")
+            lines.append(f"     Old Call:     {iss.call_expression}")
+            lines.append(f"     Status:       MANUAL INTERVENTION REQUIRED")
+            lines.append(f"     Guidance:     {iss.proposed_fix or 'Symbol removed in new version.'}")
+            lines.append("")
+
+    # Section 3: Behavioral / Deferred Issues
+    if behavioral:
+        lines.append(f"\n[?] BEHAVIORAL / STRUCTURAL ISSUES (DEFERRED) ({len(behavioral)}):")
         lines.append("    (Must be verified post-installation via test suite)\n")
-        for idx, iss in enumerate(report.behavioral_issues, 1):
+        for idx, iss in enumerate(behavioral, 1):
             fname = Path(iss.file_path).name
             lines.append(f"  {idx}. [{iss.risk_level}] `{iss.function_name}` in {fname}:{iss.line_number}")
             lines.append(f"     Caller:   `{iss.caller_name}()`")
@@ -464,7 +574,7 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
             lines.append(f"     Status:   DEFERRED -> Post-install test verification required.")
             lines.append("")
 
-    # Section 3: File Diffs
+    # Section 4: File Diffs (Only for valid auto-fixable patches)
     if report.unified_diffs:
         lines.append(sub_border)
         lines.append("GENERATED UNIFIED DIFFS:")
@@ -478,6 +588,9 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
 
 def apply_fixes(report: PreInstallRepairReport, create_backup: bool = True) -> list[str]:
     """Apply generated patches to files on disk.
+
+    Only applies valid Python code patches. Any invalid patches or manual
+    intervention items are strictly excluded.
 
     Args:
         report: The PreInstallRepairReport containing patched file contents.
@@ -493,6 +606,13 @@ def apply_fixes(report: PreInstallRepairReport, create_backup: bool = True) -> l
         if not p.is_file():
             continue
 
+        # Strictly verify that new_content is syntactically valid Python before writing
+        try:
+            ast.parse(new_content)
+        except SyntaxError as e:
+            print(f"[!] Warning: Skipping candidate patch for {file_path} because it produced a syntax error: {e}", file=sys.stderr)
+            continue
+
         if create_backup:
             backup_path = p.with_suffix(p.suffix + ".bak")
             shutil.copy2(p, backup_path)
@@ -505,11 +625,31 @@ def apply_fixes(report: PreInstallRepairReport, create_backup: bool = True) -> l
 
 
 def install_new_library(new_library_spec: str) -> bool:
-    """Execute `pip install <new_library_spec>` using subprocess.
+    """Execute installation of the new library using pip or local module installation.
+
+    Args:
+        new_library_spec: Package specification, wheel path, package directory, or python file.
 
     Returns:
         bool: True if installation succeeded (exit code 0), False otherwise.
     """
+    p = Path(new_library_spec)
+    # If the spec points directly to a single standalone .py file (e.g. in file-based demos)
+    if p.is_file() and p.suffix == ".py":
+        try:
+            import site
+            site_dirs = site.getsitepackages() if hasattr(site, "getsitepackages") else []
+            if not site_dirs:
+                site_dirs = [site.getusersitepackages()]
+            for sdir in site_dirs:
+                sp = Path(sdir)
+                if sp.is_dir() and os.access(sp, os.W_OK):
+                    dest = sp / p.name
+                    shutil.copy2(p, dest)
+                    return True
+        except Exception:
+            pass
+
     cmd = [sys.executable, "-m", "pip", "install", new_library_spec]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -524,6 +664,7 @@ def run_pre_install_repair(
     client_path: Union[str, Path],
     action: Optional[str] = None,
     api_key: Optional[str] = None,
+    deepseek_model: str = "deepseek-chat",
     install_target: Optional[str] = None,
     interactive: bool = False,
 ) -> PreInstallRepairReport:
@@ -542,7 +683,8 @@ def run_pre_install_repair(
         new_path: Path to new library version.
         client_path: Path to client application codebase.
         action: 'apply_and_install', 'apply_only', 'report_only', or None.
-        api_key: Optional DeepSeek API key (or uses DEEPSEEK_API_KEY env).
+        api_key: Optional Groq / DeepSeek API key.
+        deepseek_model: LLM model identifier (default: "deepseek-chat").
         install_target: Library spec or path to pass to pip install (defaults to str(new_path)).
         interactive: If True and action is None, prompt user via stdin.
 
@@ -555,6 +697,7 @@ def run_pre_install_repair(
         new_path=new_path,
         client_path=client_path,
         api_key=api_key,
+        deepseek_model=deepseek_model,
     )
 
     # 2. Display the clear report
@@ -598,7 +741,7 @@ def run_pre_install_repair(
         if success:
             print("[OK] Library installed successfully!")
         else:
-            print(f"[!] Warning: Library installation exited with error. Check package spec: {target_spec}")
+            print(f"[!] Warning: Library installation failed for '{target_spec}'. Please verify the package specification and network connection.", file=sys.stderr)
 
     elif chosen_action in ("apply_only", "2"):
         print("\n[>>] Applying fixes only (skipping library installation)...")

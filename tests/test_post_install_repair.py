@@ -21,6 +21,7 @@ from safedep.post_install_repair import (
     run_post_install_repair,
     run_pytest,
 )
+from safedep.pre_install_repair import run_pre_install_repair
 
 
 class TestPostInstallRepair(unittest.TestCase):
@@ -262,9 +263,238 @@ def test_status():
         self.assertIn("TEST-GATED", formatted)
         self.assertIn("Maximum 2 retries per issue", formatted)
         self.assertIn("[+] RESOLVED BEHAVIORAL ISSUES (1):", formatted)
+        self.assertIn("WHAT WAS FIXED", formatted)
+        self.assertIn("Retries Used: Attempt 1 of 2", formatted)
         self.assertIn("get_rate(0.15)", formatted)
+
+    def test_symbol_mapping_with_variable_assignment(self):
+        """Test mapping test failure when variable assignment precedes assertion."""
+        with tempfile.TemporaryDirectory() as td:
+            dir_path = Path(td)
+            client_file = self._write_file(
+                dir_path,
+                "billing.py",
+                """
+def calculate_charge(amount: float) -> float:
+    rate = 0.20  # Fix: rate = 0.15
+    return amount * rate
+""",
+            )
+            test_file = self._write_file(
+                dir_path,
+                "test_billing.py",
+                """
+from billing import calculate_charge
+
+def test_charge():
+    charge = calculate_charge(100.0)
+    assert charge == 15.0
+""",
+            )
+
+            def fake_propose_patch(code_snippet, breaking_change_info, **kwargs):
+                if "0.20" in code_snippet:
+                    return "rate = 0.15"
+                return code_snippet
+
+            with patch("safedep.post_install_repair.propose_patch", side_effect=fake_propose_patch):
+                report = run_post_install_repair(
+                    test_target=test_file,
+                    client_path=client_file,
+                    cwd=dir_path,
+                )
+
+            self.assertTrue(report.final_tests_passed)
+            self.assertEqual(report.fixed_count, 1)
+            self.assertIn("rate = 0.15", client_file.read_text(encoding="utf-8"))
+
+    def test_retry_capped_at_two_and_full_reversion(self):
+        """Test that retries are strictly capped at 2 and file is bit-for-bit reverted on failure."""
+        with tempfile.TemporaryDirectory() as td:
+            dir_path = Path(td)
+            client_file = self._write_file(
+                dir_path,
+                "handler.py",
+                """
+def handle_event():
+    return "INITIAL_STATE"
+""",
+            )
+            test_file = self._write_file(
+                dir_path,
+                "test_handler.py",
+                """
+from handler import handle_event
+
+def test_event():
+    assert handle_event() == "CORRECT_VALUE"
+""",
+            )
+            original_code = client_file.read_text(encoding="utf-8")
+
+            call_count = 0
+
+            def failing_patch(code_snippet, breaking_change_info, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                return f'return "WRONG_ATTEMPT_{call_count}"'
+
+            with patch("safedep.post_install_repair.propose_patch", side_effect=failing_patch):
+                # Pass max_retries=10 -> must be capped at 2!
+                report = run_post_install_repair(
+                    test_target=test_file,
+                    client_path=client_file,
+                    max_retries=10,
+                    cwd=dir_path,
+                )
+
+            self.assertFalse(report.final_tests_passed)
+            self.assertEqual(report.fixed_count, 0)
+            self.assertEqual(report.failed_count, 1)
+            self.assertEqual(report.max_retries, 2)
+            self.assertEqual(call_count, 2)
+            self.assertEqual(report.failed_issues[0].attempt_count, 2)
+            self.assertTrue(report.failed_issues[0].reverted)
+            # Bit-for-bit exact match to original code
+            self.assertEqual(client_file.read_text(encoding="utf-8"), original_code)
+
+    def test_format_post_install_report_shows_both_fixed_and_failed_with_retries(self):
+        """Test report clearly displays What was fixed, What failed, and Retries used."""
+        report = PostInstallRepairReport(
+            initial_tests_passed=False,
+            final_tests_passed=False,
+            total_issues_detected=2,
+            fixed_count=1,
+            failed_count=1,
+            max_retries=2,
+            fixed_issues=[
+                PostInstallIssue(
+                    test_name="test_ok",
+                    file_path="app.py",
+                    line_number=5,
+                    call_expression="val = 20",
+                    error_type="AssertionError",
+                    error_message="assert 20 == 15",
+                    attempt_count=1,
+                    fixed=True,
+                    proposed_fix="val = 15",
+                    patch_diff="- val = 20\n+ val = 15",
+                )
+            ],
+            failed_issues=[
+                PostInstallIssue(
+                    test_name="test_bad",
+                    file_path="service.py",
+                    line_number=20,
+                    call_expression="raise_err()",
+                    error_type="RuntimeError",
+                    error_message="unhandled failure",
+                    attempt_count=2,
+                    fixed=False,
+                    reverted=True,
+                    error_output="RuntimeError: unhandled failure",
+                )
+            ],
+        )
+
+        formatted = format_post_install_report(report)
+        self.assertIn("WHAT WAS FIXED", formatted)
+        self.assertIn("WHAT FAILED", formatted)
+        self.assertIn("Attempt 1 of 2 (Fixed on first try)", formatted)
+        self.assertIn("2 of 2 retries exhausted", formatted)
+        self.assertIn("REVERTED", formatted)
+
+    def test_full_integrated_repair_pipeline(self):
+        """End-to-end test of the complete pipeline: Pre-Repair -> Install -> Post-Repair."""
+        with tempfile.TemporaryDirectory() as td:
+            dir_path = Path(td)
+            old_lib = self._write_file(
+                dir_path,
+                "my_lib_v1.py",
+                """
+def calculate_tax(amount: float, rate: float = 0.20) -> float:
+    return amount * rate
+
+def process_order(item_id: int, timeout: int = 30) -> str:
+    return f"Processed {item_id}"
+""",
+            )
+            # v2: signature change on process_order (timeout removed), behavioral change on calculate_tax (rate=0.15)
+            new_lib = self._write_file(
+                dir_path,
+                "my_lib.py",
+                """
+def calculate_tax(amount: float, rate: float = 0.15) -> float:
+    return amount * rate
+
+def process_order(item_id: int) -> str:
+    return f"Processed {item_id}"
+""",
+            )
+            client_file = self._write_file(
+                dir_path,
+                "app.py",
+                """
+from my_lib import calculate_tax, process_order
+
+def run_app():
+    res = process_order(101, timeout=30)
+    tax = compute_tax(100.0)
+    return {"order": res, "tax": tax}
+
+def compute_tax(amount: float) -> float:
+    # Fix: return calculate_tax(amount, rate=0.15)
+    return calculate_tax(amount, rate=0.20)
+""",
+            )
+            test_file = self._write_file(
+                dir_path,
+                "test_app.py",
+                """
+from app import compute_tax, run_app
+
+def test_order():
+    assert run_app()["order"] == "Processed 101"
+
+def test_tax():
+    assert compute_tax(100.0) == 15.0
+""",
+            )
+
+            # Step 1: Pre-Install Repair (signature fix)
+            pre_report = run_pre_install_repair(
+                old_path=old_lib,
+                new_path=new_lib,
+                client_path=client_file,
+                action="apply_only",
+            )
+            self.assertEqual(pre_report.syntactical_count, 1)
+            self.assertIn("process_order(101)", client_file.read_text(encoding="utf-8"))
+
+            # Step 2: Test fails initially due to behavioral rate mismatch
+            init_test = run_pytest(test_file, cwd=dir_path)
+            self.assertFalse(init_test.passed)
+
+            # Step 3: Post-Install Repair (test-gated)
+            def behavioral_patch(code_snippet, breaking_change_info, **kwargs):
+                if "0.20" in code_snippet:
+                    return "return calculate_tax(amount, rate=0.15)"
+                return code_snippet
+
+            with patch("safedep.post_install_repair.propose_patch", side_effect=behavioral_patch):
+                post_report = run_post_install_repair(
+                    test_target=test_file,
+                    client_path=client_file,
+                    cwd=dir_path,
+                )
+
+            self.assertTrue(post_report.final_tests_passed)
+            self.assertEqual(post_report.fixed_count, 1)
+            self.assertIn("return calculate_tax(amount, rate=0.15)", client_file.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
 

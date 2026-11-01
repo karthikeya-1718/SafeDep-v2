@@ -202,6 +202,67 @@ def run_app():
             backup_file = client_file.with_suffix(".py.bak")
             self.assertFalse(backup_file.exists())
 
+    def test_removed_functions_marked_manual_intervention_and_never_auto_patched(self):
+        """Test that removed functions are marked as Manual Intervention Required and never auto-patched."""
+        with tempfile.TemporaryDirectory() as td:
+            dir_path = Path(td)
+            old_file = self._write_file(dir_path, "v1.py", "def obsolete_call(): pass\ndef query(sql, timeout=10): pass")
+            new_file = self._write_file(dir_path, "v2.py", "def query(sql): pass")
+            client_file = self._write_file(
+                dir_path,
+                "app.py",
+                "def run():\n    obsolete_call()\n    query('SELECT *', timeout=5)\n",
+            )
+
+            report = run_pre_install_repair(old_file, new_file, client_file, action="apply_only")
+
+            # Check issue properties
+            obsolete_issue = next(i for i in report.syntactical_issues if i.function_name == "obsolete_call")
+            self.assertTrue(obsolete_issue.is_removal)
+            self.assertTrue(obsolete_issue.manual_intervention_required)
+            self.assertIn("Manual Intervention Required", obsolete_issue.proposed_fix)
+            self.assertEqual(obsolete_issue.patch_diff, "")
+
+            # Verify that query() was auto-patched, but obsolete_call() was NOT replaced with English text
+            client_content = client_file.read_text(encoding="utf-8")
+            self.assertIn("query('SELECT *')", client_content)
+            self.assertIn("obsolete_call()", client_content)
+            self.assertNotIn("Manual Intervention", client_content)
+            self.assertNotIn("no longer exists", client_content)
+
+            # Ensure client file remains completely valid Python syntax
+            import ast
+            ast.parse(client_content)
+
+    def test_report_formatting_separates_three_categories(self):
+        """Test that format_pre_install_report clearly separates all three categories."""
+        with tempfile.TemporaryDirectory() as td:
+            dir_path = Path(td)
+            old_file = self._write_file(
+                dir_path,
+                "v1.py",
+                "def remove_me(): pass\ndef query(sql, timeout=10): pass\ndef runtime_behavior(): pass",
+            )
+            new_file = self._write_file(
+                dir_path,
+                "v2.py",
+                "def query(sql): pass\ndef runtime_behavior(): pass",
+            )
+            client_file = self._write_file(
+                dir_path,
+                "app.py",
+                "def run():\n    remove_me()\n    query('SELECT', timeout=5)\n    runtime_behavior()\n",
+            )
+
+            report = analyze_pre_install_issues(old_file, new_file, client_file)
+            formatted = format_pre_install_report(report)
+
+            # Verify the 3 distinct section headers are present
+            self.assertIn("[+] AUTO-FIXABLE SIGNATURE CHANGES", formatted)
+            self.assertIn("[!] REMOVED FUNCTIONS / SYMBOLS (MANUAL INTERVENTION REQUIRED)", formatted)
+            self.assertIn("Removed functions (manual intervention):", formatted)
+            self.assertIn("Syntactical / signature issues (fixable now):", formatted)
+
 
 if __name__ == "__main__":
     unittest.main()

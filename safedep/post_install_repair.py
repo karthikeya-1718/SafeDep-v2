@@ -7,16 +7,17 @@ Implements the Post-Install Repair mode:
 4. Uses the shared `propose_patch` function from `safedep.patcher` to generate candidate fixes.
 5. Applies patches and re-runs the tests.
 6. Strictly test-gated: only accepts a patch if tests pass (or the specific failure is resolved).
-   If a patch fails tests, the file is immediately reverted.
-7. Allows a maximum of 2 retries per issue.
-8. Produces a clear report detailing:
+   If a patch fails tests, the file is immediately and fully reverted.
+7. Allows a clean maximum of 2 retries per issue.
+8. Produces a clear final report detailing:
    - What was fixed
-   - What still failed
-   - Explicit note that this mode primarily handles remaining behavioral/runtime issues
+   - What failed
+   - Number of retries used
 """
 
 from __future__ import annotations
 
+import ast
 import difflib
 import os
 import re
@@ -47,6 +48,7 @@ class PostInstallIssue:
     patch_diff: Optional[str] = None
     error_output: str = ""
     suggested_fix: Optional[str] = None
+    reverted: bool = False
 
 
 @dataclass
@@ -77,6 +79,7 @@ class PostInstallRepairReport:
     unified_diffs: dict[str, str] = field(default_factory=dict)
     test_output_before: str = ""
     test_output_after: str = ""
+    max_retries: int = 2
 
     def to_dict(self) -> dict[str, Any]:
         """Convert report to dictionary format."""
@@ -87,6 +90,7 @@ class PostInstallRepairReport:
             "total_issues_detected": self.total_issues_detected,
             "fixed_count": self.fixed_count,
             "failed_count": self.failed_count,
+            "max_retries": self.max_retries,
             "fixed_issues": [
                 {
                     "test_name": i.test_name,
@@ -98,6 +102,8 @@ class PostInstallRepairReport:
                     "proposed_fix": i.proposed_fix,
                     "patch_diff": i.patch_diff,
                     "attempts": i.attempt_count,
+                    "status": "FIXED",
+                    "reverted": False,
                 }
                 for i in self.fixed_issues
             ],
@@ -110,6 +116,8 @@ class PostInstallRepairReport:
                     "error_type": i.error_type,
                     "error_message": i.error_message,
                     "attempts": i.attempt_count,
+                    "status": "FAILED",
+                    "reverted": True,
                     "last_error": i.error_output,
                 }
                 for i in self.failed_issues
@@ -145,10 +153,10 @@ def run_pytest(
         sys.executable,
         "-m",
         "pytest",
-        f"--rootdir={work_dir}",
+        f"--rootdir={work_dir.resolve()}",
         "-p",
         "no:cacheprovider",
-        target_str,
+        str(target_p.resolve()),
         "-v",
         "--tb=short",
     ]
@@ -256,16 +264,18 @@ def identify_test_failures(
     client_str = str(client_path) if client_path else ""
     client_p = Path(client_str) if client_str else None
 
-    # Determine client filenames / stems if client_path is provided
+    # Determine client filenames and paths if client_path is provided
     client_files: set[str] = set()
     if client_p:
         if client_p.is_file():
             client_files.add(client_p.name)
             client_files.add(str(client_p.resolve()))
+            client_files.add(client_p.stem)
         elif client_p.is_dir():
             for f in client_p.glob("**/*.py"):
                 client_files.add(f.name)
                 client_files.add(str(f.resolve()))
+                client_files.add(f.stem)
 
     # Split output into failure blocks by '___+ test_name ___+'
     header_pattern = re.compile(r"_{3,}\s*(.*?)\s*_{3,}")
@@ -296,7 +306,6 @@ def identify_test_failures(
             line_no = 1
             call_expr = ""
 
-            # Locate in test_output any line like file_part:12:
             f_match = re.search(re.escape(file_part) + r":(\d+):", test_output)
             if f_match:
                 line_no = int(f_match.group(1))
@@ -345,36 +354,39 @@ def _parse_single_failure_block(
                 err_msg = line[2:].strip()
                 break
 
-    # 2. Extract call expression: line starting with '>   '
-    call_expr = ""
+    # 2. Extract call expression: collect lines starting with '>' (handles multiline assertions)
+    call_lines: list[str] = []
+    in_call = False
     for idx, line in enumerate(lines):
         if line.startswith(">") and not line.startswith(">>>"):
-            call_expr = line[1:].strip()
+            call_lines.append(line[1:].strip())
+            in_call = True
+        elif in_call:
             break
-        # Fallback for pytest 8/9 short traceback: code line right after file frame
-        if ": in " in line and idx + 1 < len(lines):
+        # Fallback for pytest short traceback: code line right after file frame
+        elif ": in " in line and idx + 1 < len(lines):
             next_l = lines[idx + 1]
             if next_l.startswith("    ") and not next_l.strip().startswith("E "):
-                call_expr = next_l.strip()
+                call_lines.append(next_l.strip())
+                break
 
-    # 3. Extract file and line frames:
-    # Patterns:
-    #   path.py:line: in func
-    #   File "path.py", line X, in func
+    call_expr = " ".join(call_lines).strip()
+
+    # 3. Extract file and line frames (matching Windows paths, quoted paths, and standard paths)
     frame_matches = re.findall(
-        r'(?:([A-Za-z0-9_./\\-]+\.py):(\d+):|File\s+"([^"]+)",\s+line\s+(\d+))',
+        r'(?:File\s+"([^"]+\.py)",\s+line\s+(\d+)|([A-Za-z]:\\[^:\r\n]+\.py):(\d+)|([^\s:\r\n]+\.py):(\d+))',
         block_text,
     )
 
     chosen_file = ""
     chosen_line = 1
 
-    # Prefer frames matching client files
+    # Prefer frames matching client files (search from innermost to outermost)
     for m in reversed(frame_matches):
-        fp = m[0] or m[2]
-        ln = int(m[1] or m[3])
+        fp = m[0] or m[2] or m[4]
+        ln = int(m[1] or m[3] or m[5])
         p = Path(fp)
-        if p.name in client_files or str(p.resolve()) in client_files:
+        if p.name in client_files or p.stem in client_files or str(p.resolve()) in client_files:
             chosen_file = fp
             chosen_line = ln
             break
@@ -382,8 +394,8 @@ def _parse_single_failure_block(
     # If no client frame found, take the frame closest to the error
     if not chosen_file and frame_matches:
         last = frame_matches[-1]
-        chosen_file = last[0] or last[2]
-        chosen_line = int(last[1] or last[3])
+        chosen_file = last[0] or last[2] or last[4]
+        chosen_line = int(last[1] or last[3] or last[5])
 
     # Fallback to client_str if provided and file not found
     if not chosen_file and client_str:
@@ -400,7 +412,166 @@ def _parse_single_failure_block(
         error_type=err_type,
         error_message=err_msg,
         code_context="",
+        error_output=block_text[:400],
     )
+
+
+def _find_called_client_symbols_in_test(
+    test_path: Path,
+    test_lineno: int,
+    call_expr: str,
+    failure_output: str,
+    client_candidates: list[Path],
+) -> list[str]:
+    """Identify candidate client function/method names invoked by a failing test.
+
+    Order of priority:
+    1. Introspection expressions (e.g. 'where 20.0 = func(...)').
+    2. Direct call expressions in the assertion statement.
+    3. Function calls assigned to variables used in the assertion statement.
+    4. Client functions/methods imported and called inside the failing test function.
+    """
+    candidates: list[str] = []
+
+    # Priority 1: Assertion introspection lines (e.g. 'where 20.0 = func(...)')
+    if failure_output:
+        for match in re.finditer(r"where\s+.*?=\s*([A-Za-z0-9_]+)\(", failure_output):
+            candidates.append(match.group(1))
+
+    # Priority 2: Direct call expressions in the assertion
+    if call_expr:
+        try:
+            tree = ast.parse(call_expr)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    name = getattr(node.func, "id", getattr(node.func, "attr", None))
+                    if name:
+                        candidates.append(name)
+        except Exception:
+            pass
+
+    # Priority 3: Test function AST inspection
+    if test_path.is_file():
+        try:
+            test_text = test_path.read_text(encoding="utf-8")
+            test_tree = ast.parse(test_text)
+            test_lines = test_text.splitlines()
+
+            # Find imports from client files
+            client_stems = {c.stem for c in client_candidates}
+            client_imported_names: set[str] = set()
+            for node in ast.walk(test_tree):
+                if isinstance(node, ast.ImportFrom) and node.module in client_stems:
+                    for alias in node.names:
+                        client_imported_names.add(alias.asname or alias.name)
+
+            # Find the enclosing test function
+            enclosing_func: Optional[Union[ast.FunctionDef, ast.AsyncFunctionDef]] = None
+            for node in ast.walk(test_tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    start_l = node.lineno
+                    end_l = getattr(node, "end_lineno", len(test_lines))
+                    if start_l <= test_lineno <= end_l:
+                        enclosing_func = node
+                        break
+
+            if enclosing_func:
+                vars_in_assertion: set[str] = set()
+                if call_expr:
+                    try:
+                        c_ast = ast.parse(call_expr)
+                        for n in ast.walk(c_ast):
+                            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                                vars_in_assertion.add(n.id)
+                    except Exception:
+                        pass
+
+                for stmt in enclosing_func.body:
+                    if isinstance(stmt, ast.Assign):
+                        for tgt in stmt.targets:
+                            if isinstance(tgt, ast.Name) and tgt.id in vars_in_assertion:
+                                for sub in ast.walk(stmt.value):
+                                    if isinstance(sub, ast.Call):
+                                        fn_name = getattr(sub.func, "id", getattr(sub.func, "attr", None))
+                                        if fn_name:
+                                            candidates.append(fn_name)
+
+                    for sub in ast.walk(stmt):
+                        if isinstance(sub, ast.Call):
+                            fn_name = getattr(sub.func, "id", getattr(sub.func, "attr", None))
+                            if fn_name and fn_name in client_imported_names:
+                                candidates.append(fn_name)
+        except Exception:
+            pass
+
+    # Deduplicate while preserving order
+    unique_candidates: list[str] = []
+    for c in candidates:
+        if c not in unique_candidates:
+            unique_candidates.append(c)
+
+    return unique_candidates
+
+
+def _map_symbol_to_client_code(
+    symbol_name: str,
+    client_candidates: list[Path],
+) -> Optional[tuple[Path, int, str, str, Optional[str]]]:
+    """Locate a function or method definition in client candidates and find the target line to repair.
+
+    Returns:
+        (file_path, line_number, line_content, code_context, suggested_fix) or None.
+    """
+    for cfile in client_candidates:
+        if not cfile.is_file():
+            continue
+        try:
+            c_text = cfile.read_text(encoding="utf-8")
+            c_tree = ast.parse(c_text)
+            c_lines = c_text.splitlines()
+
+            for node in ast.walk(c_tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol_name:
+                    start_l = node.lineno
+                    end_l = getattr(node, "end_lineno", len(c_lines))
+
+                    target_lineno = start_l
+                    hint: Optional[str] = None
+
+                    # Check for explicit fix comments inside function body
+                    for lno in range(start_l, min(end_l + 1, len(c_lines) + 1)):
+                        line_str = c_lines[lno - 1]
+                        m = re.search(r"#\s*(?:Suggestion|Fix|SUGGESTED_FIX):\s*(.+)$", line_str, re.IGNORECASE)
+                        if m:
+                            hint = m.group(1).strip()
+                            # If comment is standalone on its own line, target the following code line
+                            if line_str.strip().startswith("#") and lno < len(c_lines):
+                                target_lineno = lno + 1
+                            else:
+                                target_lineno = lno
+                            break
+                    else:
+                        for stmt in ast.walk(node):
+                            if isinstance(stmt, ast.Return) and hasattr(stmt, "lineno"):
+                                target_lineno = stmt.lineno
+                                break
+                        else:
+                            if node.body and hasattr(node.body[0], "lineno"):
+                                target_lineno = node.body[0].lineno
+
+                    if 1 <= target_lineno <= len(c_lines):
+                        line_content = c_lines[target_lineno - 1].strip()
+                        start = max(0, target_lineno - 4)
+                        end = min(len(c_lines), target_lineno + 3)
+                        code_context = "\n".join(c_lines[start:end])
+                        if not hint:
+                            m_ctx = re.search(r"#\s*(?:Suggestion|Fix|SUGGESTED_FIX):\s*(.+)$", code_context, re.IGNORECASE)
+                            if m_ctx:
+                                hint = m_ctx.group(1).strip()
+                        return (cfile, target_lineno, line_content, code_context, hint)
+        except Exception:
+            continue
+    return None
 
 
 def _resolve_and_map_issue(
@@ -409,8 +580,6 @@ def _resolve_and_map_issue(
     search_dirs: list[Path],
 ) -> PostInstallIssue:
     """Resolve relative file paths and map test assertions to client source definitions."""
-    import ast
-
     target_p = Path(issue.file_path)
     if not target_p.is_file():
         for sdir in search_dirs:
@@ -430,11 +599,20 @@ def _resolve_and_map_issue(
                 start = max(0, issue.line_number - 4)
                 end = min(len(file_lines), issue.line_number + 3)
                 issue.code_context = "\n".join(file_lines[start:end])
+
+                # Detect fix hint if already in client file
+                hint_match = re.search(
+                    r"#\s*(?:Suggestion|Fix|SUGGESTED_FIX):\s*(.+)$",
+                    issue.code_context,
+                    re.MULTILINE | re.IGNORECASE,
+                )
+                if hint_match:
+                    issue.suggested_fix = hint_match.group(1).strip()
         except Exception:
             pass
 
     # If failure is inside a test file and client_path is provided,
-    # inspect called client symbols to locate the definition inside client code
+    # map test assertions to client source definitions
     if client_path:
         cp = Path(client_path)
         client_candidates: list[Path] = []
@@ -451,44 +629,25 @@ def _resolve_and_map_issue(
                     client_candidates.extend(cand.resolve().glob("**/*.py"))
 
         is_test_file = "test" in target_p.name.lower() or "tests" in target_p.parts
-        if is_test_file and issue.call_expression:
-            try:
-                tree = ast.parse(issue.call_expression)
-                called_names: list[str] = []
-                for n in ast.walk(tree):
-                    if isinstance(n, ast.Call):
-                        name = getattr(n.func, "id", getattr(n.func, "attr", None))
-                        if name:
-                            called_names.append(name)
-
-                for cfile in client_candidates:
-                    if not cfile.is_file():
-                        continue
-                    c_text = cfile.read_text(encoding="utf-8")
-                    c_tree = ast.parse(c_text)
-                    for node in ast.walk(c_tree):
-                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in called_names:
-                            target_lineno = node.lineno
-                            # Locate the return statement or first statement
-                            for stmt in ast.walk(node):
-                                if isinstance(stmt, ast.Return) and hasattr(stmt, "lineno"):
-                                    target_lineno = stmt.lineno
-                                    break
-                            else:
-                                if node.body and hasattr(node.body[0], "lineno"):
-                                    target_lineno = node.body[0].lineno
-
-                            c_lines = c_text.splitlines()
-                            if 1 <= target_lineno <= len(c_lines):
-                                issue.file_path = str(cfile)
-                                issue.line_number = target_lineno
-                                issue.call_expression = c_lines[target_lineno - 1].strip()
-                                start = max(0, target_lineno - 4)
-                                end = min(len(c_lines), target_lineno + 3)
-                                issue.code_context = "\n".join(c_lines[start:end])
-                                return issue
-            except Exception:
-                pass
+        if is_test_file:
+            called_symbols = _find_called_client_symbols_in_test(
+                test_path=target_p,
+                test_lineno=issue.line_number,
+                call_expr=issue.call_expression,
+                failure_output=issue.error_output,
+                client_candidates=client_candidates,
+            )
+            for symbol in called_symbols:
+                mapped = _map_symbol_to_client_code(symbol, client_candidates)
+                if mapped:
+                    cfile, target_lineno, line_content, code_context, hint = mapped
+                    issue.file_path = str(cfile)
+                    issue.line_number = target_lineno
+                    issue.call_expression = line_content
+                    issue.code_context = code_context
+                    if hint:
+                        issue.suggested_fix = hint
+                    return issue
 
     return issue
 
@@ -543,6 +702,21 @@ def apply_line_patch(
     return True, original, modified
 
 
+def _matches_test_name(target_name: str, failed_name: str) -> bool:
+    """Check if target_name matches failed_name across pytest output conventions."""
+    if not target_name or not failed_name:
+        return False
+    if target_name == failed_name:
+        return True
+    if failed_name.endswith("::" + target_name) or target_name.endswith("::" + failed_name):
+        return True
+    clean_target = target_name.split("::")[-1].split("[")[0]
+    clean_failed = failed_name.split("::")[-1].split("[")[0]
+    if clean_target and clean_target == clean_failed:
+        return True
+    return False
+
+
 def run_post_install_repair(
     test_target: Union[str, Path],
     client_path: Optional[Union[str, Path]] = None,
@@ -560,21 +734,34 @@ def run_post_install_repair(
     4. Uses `propose_patch` from `patcher.py` to generate candidate fixes.
     5. Applies each candidate fix and re-runs the test suite.
     6. Strictly test-gated: only keeps the patch if tests pass; reverts on failure.
-    7. Retries up to `max_retries` (default 2) per issue.
+    7. Retries up to `max_retries` (maximum 2 retries per issue).
     8. Returns a comprehensive PostInstallRepairReport.
 
     Args:
         test_target: Path to test directory or test file.
         client_path: Optional path to client codebase to pinpoint failing files.
-        max_retries: Maximum patch attempts per issue (default 2).
-        api_key: Optional DeepSeek API key.
-        deepseek_model: DeepSeek model identifier.
+        max_retries: Maximum patch attempts per issue (capped at 2).
+        api_key: Optional Groq / DeepSeek API key.
+        deepseek_model: LLM model identifier.
         cwd: Working directory for running pytest.
         extra_pytest_args: Additional command line arguments for pytest.
 
     Returns:
         PostInstallRepairReport instance.
     """
+    effective_max_retries = max(1, min(max_retries, 2))
+
+    # Validate test target and client path
+    target_p = Path(test_target)
+    work_dir = Path(cwd) if cwd else (target_p.parent if target_p.is_file() else target_p)
+    if not target_p.exists() and not (work_dir / target_p).exists():
+        raise FileNotFoundError(f"Test target path does not exist: '{test_target}'")
+
+    if client_path:
+        cp = Path(client_path)
+        if not cp.exists() and not (work_dir / cp).exists():
+            raise FileNotFoundError(f"Client codebase path does not exist: '{client_path}'")
+
     # Step 1: Initial test suite run
     initial_res = run_pytest(test_target, extra_args=extra_pytest_args, cwd=cwd)
 
@@ -588,6 +775,7 @@ def run_post_install_repair(
             failed_count=0,
             test_output_before=initial_res.stdout,
             test_output_after=initial_res.stdout,
+            max_retries=effective_max_retries,
         )
 
     # Step 2: Identify test failures from test output
@@ -618,102 +806,115 @@ def run_post_install_repair(
         if not target_path.is_file():
             # If target file cannot be found, mark unresolved
             issue.error_output = f"File not found: {issue.file_path}"
+            issue.reverted = True
             failed_issues.append(issue)
             continue
 
-        original_content = target_path.read_text(encoding="utf-8")
-        current_content = original_content
+        baseline_content = target_path.read_text(encoding="utf-8")
+        current_content = baseline_content
         issue_resolved = False
+        last_error = ""
+        last_proposed = ""
 
-        for attempt in range(1, max_retries + 1):
-            issue.attempt_count = attempt
+        try:
+            for attempt in range(1, effective_max_retries + 1):
+                issue.attempt_count = attempt
 
-            # Build feedback for retry attempts
-            feedback = ""
-            if attempt > 1:
-                feedback = (
-                    f"Previous patch attempt failed tests with error: {issue.error_output[:200]}. "
-                    f"Adjust the fix to ensure tests pass."
+                # Build feedback for retry attempts
+                feedback = ""
+                if attempt > 1:
+                    feedback = (
+                        f"Previous patch attempt proposed '{last_proposed}' which failed tests: "
+                        f"{last_error[:180]}. Adjust the code logic to ensure tests pass."
+                    )
+
+                # Generate fix via shared propose_patch
+                breaking_info: dict[str, Any] = {
+                    "breaking_change": f"Behavioral failure: {issue.error_type}: {issue.error_message}",
+                    "error_type": issue.error_type,
+                    "error_message": issue.error_message,
+                    "code_context": issue.code_context,
+                    "test_name": issue.test_name,
+                    "attempt": attempt,
+                    "feedback": feedback,
+                }
+                if issue.suggested_fix:
+                    breaking_info["suggested_fix"] = issue.suggested_fix
+
+                proposed_code = propose_patch(
+                    code_snippet=issue.call_expression,
+                    breaking_change_info=breaking_info,
+                    api_key=api_key,
+                    model=deepseek_model,
                 )
 
-            # Generate fix via shared propose_patch
-            breaking_info: dict[str, Any] = {
-                "breaking_change": f"Behavioral failure: {issue.error_type}: {issue.error_message}",
-                "error_type": issue.error_type,
-                "error_message": issue.error_message,
-                "code_context": issue.code_context,
-                "test_name": issue.test_name,
-                "attempt": attempt,
-                "feedback": feedback,
-            }
-            if issue.suggested_fix:
-                breaking_info["suggested_fix"] = issue.suggested_fix
+                if not proposed_code or proposed_code == issue.call_expression:
+                    last_error = "Patcher proposed unchanged or empty replacement code"
+                    last_proposed = proposed_code or ""
+                    continue
 
-            proposed_code = propose_patch(
-                code_snippet=issue.call_expression,
-                breaking_change_info=breaking_info,
-                api_key=api_key,
-                model=deepseek_model,
-            )
-
-            if not proposed_code or proposed_code == issue.call_expression:
-                # Could not generate a different patch
-                continue
-
-            # Apply candidate patch to file
-            ok, before_patch, after_patch = apply_line_patch(
-                file_path=issue.file_path,
-                line_number=issue.line_number,
-                old_code=issue.call_expression,
-                new_code=proposed_code,
-            )
-            if not ok:
-                continue
-
-            # Step 5: Test-gating — Re-run test suite to verify fix
-            verify_res = run_pytest(test_target, extra_args=extra_pytest_args, cwd=cwd)
-
-            # Check if this test is still failing
-            still_failing = any(
-                issue.test_name == fn
-                or fn.endswith("::" + issue.test_name)
-                or issue.test_name.endswith("::" + fn)
-                for fn in verify_res.failed_test_names
-            )
-            is_test_fixed = (not still_failing) and (verify_res.passed or verify_res.failed_count < initial_res.failed_count)
-
-            if is_test_fixed:
-                # ACCEPTED! Keep the patch
-                issue.fixed = True
-                issue.proposed_fix = proposed_code
-                issue.patch_diff = f"- {issue.call_expression}\n+ {proposed_code}"
-                current_content = after_patch
-                patched_files[issue.file_path] = current_content
-
-                # Create backup file
-                backup_path = target_path.with_suffix(target_path.suffix + ".bak")
-                if not backup_path.exists():
-                    backup_path.write_text(original_content, encoding="utf-8")
-
-                diff = difflib.unified_diff(
-                    original_content.splitlines(),
-                    current_content.splitlines(),
-                    fromfile=f"a/{target_path.name}",
-                    tofile=f"b/{target_path.name}",
-                    lineterm="",
+                # Apply candidate patch to file
+                ok, before_patch, after_patch = apply_line_patch(
+                    file_path=issue.file_path,
+                    line_number=issue.line_number,
+                    old_code=issue.call_expression,
+                    new_code=proposed_code,
                 )
-                unified_diffs[issue.file_path] = "\n".join(diff)
+                if not ok:
+                    last_error = f"Failed to apply patch at line {issue.line_number}"
+                    last_proposed = proposed_code
+                    continue
 
-                fixed_issues.append(issue)
-                issue_resolved = True
-                break
-            else:
-                # REVERT! Test failed, reject candidate patch
-                target_path.write_text(current_content, encoding="utf-8")
-                issue.error_output = (verify_res.stdout + "\n" + verify_res.stderr)[:300]
+                # Step 5: Test-gating — Re-run test suite to verify fix
+                verify_res = run_pytest(test_target, extra_args=extra_pytest_args, cwd=cwd)
 
-        if not issue_resolved:
-            failed_issues.append(issue)
+                # Check if this test is still failing
+                still_failing = any(
+                    _matches_test_name(issue.test_name, fn)
+                    for fn in verify_res.failed_test_names
+                )
+                is_test_fixed = (not still_failing) and (verify_res.passed or verify_res.failed_count < initial_res.failed_count)
+
+                if is_test_fixed:
+                    # ACCEPTED! Keep the patch
+                    issue.fixed = True
+                    issue.proposed_fix = proposed_code
+                    issue.patch_diff = f"- {issue.call_expression}\n+ {proposed_code}"
+                    issue.reverted = False
+                    current_content = after_patch
+                    patched_files[issue.file_path] = current_content
+
+                    # Create backup file
+                    backup_path = target_path.with_suffix(target_path.suffix + ".bak")
+                    if not backup_path.exists():
+                        backup_path.write_text(baseline_content, encoding="utf-8")
+
+                    diff = difflib.unified_diff(
+                        baseline_content.splitlines(),
+                        current_content.splitlines(),
+                        fromfile=f"a/{target_path.name}",
+                        tofile=f"b/{target_path.name}",
+                        lineterm="",
+                    )
+                    unified_diffs[issue.file_path] = "\n".join(diff)
+
+                    fixed_issues.append(issue)
+                    issue_resolved = True
+                    break
+                else:
+                    # REVERT! Test failed, reject candidate patch immediately
+                    target_path.write_text(baseline_content, encoding="utf-8")
+                    issue.reverted = True
+                    last_error = (verify_res.stdout + "\n" + verify_res.stderr).strip()
+                    last_proposed = proposed_code
+                    issue.error_output = last_error[:300]
+        finally:
+            # Absolute guarantee: if candidate patches failed tests, revert completely
+            if not issue_resolved:
+                target_path.write_text(baseline_content, encoding="utf-8")
+                issue.reverted = True
+                if issue not in failed_issues:
+                    failed_issues.append(issue)
 
     # Step 4: Final test run to verify the overall status
     final_res = run_pytest(test_target, extra_args=extra_pytest_args, cwd=cwd)
@@ -730,6 +931,7 @@ def run_post_install_repair(
         unified_diffs=unified_diffs,
         test_output_before=initial_res.stdout,
         test_output_after=final_res.stdout,
+        max_retries=effective_max_retries,
     )
 
 
@@ -738,18 +940,19 @@ def format_post_install_report(report: PostInstallRepairReport) -> str:
     border = "=" * 70
     sub_border = "-" * 70
 
-    initial_status = "PASSED" if report.initial_tests_passed else f"FAILED ({report.total_issues_detected} issue(s))"
-    final_status = "PASSED (All test suite assertions satisfied)" if report.final_tests_passed else "FAILED (Some issues unresolved)"
+    initial_status = "PASSED" if report.initial_tests_passed else f"FAILED ({report.total_issues_detected} issue(s) detected)"
+    final_status = "PASSED (All test suite assertions satisfied)" if report.final_tests_passed else f"FAILED ({report.failed_count} issue(s) unresolved)"
 
     lines = [
         border,
         "  SAFEDEP - POST-INSTALL REPAIR REPORT (TEST-GATED)",
         border,
         "STATUS SUMMARY:",
-        f"  * Initial Test Status:                                {initial_status}",
-        f"  * Final Test Status:                                  {final_status}",
-        f"  * Behavioral Issues Resolved:                         {report.fixed_count}",
-        f"  * Unresolved Issues:                                  {report.failed_count}",
+        f"  * Initial Test Status:           {initial_status}",
+        f"  * Final Test Status:             {final_status}",
+        f"  * Behavioral Issues Resolved:    {report.fixed_count}",
+        f"  * Unresolved Issues:             {report.failed_count}",
+        f"  * Max Retries Allowed:           {report.max_retries}",
         sub_border,
         "IMPORTANT NOTE ON POST-INSTALL REPAIR:",
         "  [!] Post-Install Repair assumes the new library version is ALREADY installed.",
@@ -758,38 +961,51 @@ def format_post_install_report(report: PostInstallRepairReport) -> str:
         "      that can ONLY be detected by running the client project's test suite (pytest).",
         "  [!] All patches are TEST-GATED: candidate fixes are only kept if pytest confirms",
         "      the tests pass. If a proposed fix fails tests, it is immediately reverted.",
-        "  [!] Maximum 2 retries per issue are attempted.",
+        f"  [!] Maximum {report.max_retries} retries per issue are attempted.",
         sub_border,
     ]
 
-    # Section 1: Resolved Issues
+    # Section 1: What was fixed
+    lines.append(f"\n[+] RESOLVED BEHAVIORAL ISSUES ({report.fixed_count}):")
     if report.fixed_issues:
-        lines.append(f"\n[+] RESOLVED BEHAVIORAL ISSUES ({report.fixed_count}):")
-        lines.append("    (Verified passing by client project test suite)\n")
+        lines.append("    WHAT WAS FIXED (Verified passing by client project test suite):\n")
         for idx, iss in enumerate(report.fixed_issues, 1):
             fname = Path(iss.file_path).name
+            retries_text = f"Attempt {iss.attempt_count} of {report.max_retries}" + (
+                " (Fixed on first try)" if iss.attempt_count == 1 else f" (Fixed on retry {iss.attempt_count - 1})"
+            )
             lines.append(f"  {idx}. [FIXED] Test `{iss.test_name}` in {fname}:{iss.line_number}")
+            lines.append(f"     Status:       WHAT WAS FIXED (Resolved successfully)")
             lines.append(f"     Error:        {iss.error_type}: {iss.error_message}")
             lines.append(f"     Old Code:     {iss.call_expression}")
             lines.append(f"     Accepted Fix: {iss.proposed_fix}")
-            lines.append(f"     Retries Used: {iss.attempt_count} / 2")
+            lines.append(f"     Retries Used: {retries_text}")
+            lines.append("     Verification: PASSED (Test-gated assertion satisfied)")
             if iss.patch_diff:
                 lines.append(f"     Diff:         {iss.patch_diff.replace(chr(10), ' | ')}")
-            lines.append("     Verification: PASSED (Test-gated assertion satisfied)")
             lines.append("")
+    else:
+        lines.append("    WHAT WAS FIXED: None (No issues were fixed)\n")
 
-    # Section 2: Unresolved Issues
+    # Section 2: What failed
+    lines.append(f"[x] UNRESOLVED ISSUES ({report.failed_count}):")
     if report.failed_issues:
-        lines.append(f"\n[x] UNRESOLVED ISSUES ({report.failed_count}):")
-        lines.append("    (Retries exhausted; proposed patches failed test gating)\n")
+        lines.append("    WHAT FAILED (Retries exhausted; candidate patches failed test gating and were reverted):\n")
         for idx, iss in enumerate(report.failed_issues, 1):
             fname = Path(iss.file_path).name
+            retries_text = f"{iss.attempt_count} of {report.max_retries} retries exhausted"
             lines.append(f"  {idx}. [UNRESOLVED] Test `{iss.test_name}` in {fname}:{iss.line_number}")
-            lines.append(f"     Error:   {iss.error_type}: {iss.error_message}")
-            lines.append(f"     Code:    {iss.call_expression}")
-            lines.append(f"     Retries: {iss.attempt_count} / 2 exhausted")
-            lines.append("     Status:  REVERTED -> Manual review / investigation required.")
+            lines.append(f"     Status:       WHAT FAILED / REVERTED (Original code restored; manual review required)")
+            lines.append(f"     Error:        {iss.error_type}: {iss.error_message}")
+            lines.append(f"     Code:         {iss.call_expression}")
+            lines.append(f"     Retries Used: {retries_text}")
+            if iss.error_output:
+                clean_err = iss.error_output.strip().splitlines()
+                first_err = clean_err[0] if clean_err else ""
+                lines.append(f"     Last Error:   {first_err}")
             lines.append("")
+    else:
+        lines.append("    WHAT FAILED: None (All detected test failures were successfully resolved)\n")
 
     # Section 3: Unified Diffs
     if report.unified_diffs:

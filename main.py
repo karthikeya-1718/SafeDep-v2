@@ -194,10 +194,11 @@ def _validate_path(path_str: str, label: str) -> Path:
 
 
 def _check_api_key_notice() -> None:
-    """Print an informative notice if DEEPSEEK_API_KEY is not set."""
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        print("[INFO] DEEPSEEK_API_KEY is not set in environment.")
-        print("       SafeDep will use its offline deterministic AST refactoring engine.\n")
+    """Print an informative notice if neither GROQ_API_KEY nor DEEPSEEK_API_KEY is set."""
+    if not os.environ.get("GROQ_API_KEY") and not os.environ.get("DEEPSEEK_API_KEY"):
+        if "--json" not in sys.argv:
+            print("[INFO] No LLM API key (GROQ_API_KEY / DEEPSEEK_API_KEY) found in environment.")
+            print("       SafeDep will use its offline deterministic AST refactoring engine.\n")
 
 
 # ===========================================================================
