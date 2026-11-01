@@ -1,12 +1,15 @@
 """SafeDep Patcher Module.
 
 Provides a single public entry-point for generating code patches that fix
-API breaking-change call sites.  Two strategies are tried in order:
+API breaking-change call sites. Supported strategies (in priority order):
 
-1. **DeepSeek API** (remote, requires ``DEEPSEEK_API_KEY`` in the environment
-   or passed explicitly) — returns an LLM-generated replacement expression.
-2. **AST rule-based fallback** (offline, deterministic) — handles the most
-   common signature-change patterns using Python's ``ast`` module.
+1. **Groq API** (remote, checked first via ``GROQ_API_KEY``) — uses fast
+   inference models such as ``llama-3.3-70b-versatile`` or ``openai/gpt-oss-20b``.
+2. **DeepSeek API** (remote, checked second via ``DEEPSEEK_API_KEY`` or explicit
+   key) — uses ``deepseek-chat``.
+3. **AST rule-based fallback** (offline, deterministic) — handles common
+   signature-change patterns using Python's ``ast`` module when no API key
+   is configured or when remote network calls fail.
 
 Usage::
 
@@ -31,7 +34,109 @@ import os
 import re
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
+
+# ---------------------------------------------------------------------------
+# Load .env file — supports both d:\AIML_Project\.env and SafeDep/.env
+# ---------------------------------------------------------------------------
+
+def _load_dotenv() -> None:
+    """Load environment variables from the nearest .env file.
+
+    Search order (stops at the first .env found):
+    1. SafeDep project root  → ``SafeDep/.env``
+    2. Parent workspace root → ``d:/AIML_Project/.env``
+
+    Uses python-dotenv when available; silently skips loading when the
+    package is not installed (all other functionality is unaffected).
+    """
+    try:
+        from dotenv import load_dotenv  # type: ignore[import]
+    except ImportError:
+        return  # python-dotenv not installed — skip silently
+
+    # Walk upward from this file (safedep/patcher.py) to find .env
+    search_dirs = [
+        Path(__file__).resolve().parent.parent,          # SafeDep/
+        Path(__file__).resolve().parent.parent.parent,   # d:\AIML_Project\
+    ]
+    for directory in search_dirs:
+        env_file = directory / ".env"
+        if env_file.is_file():
+            load_dotenv(dotenv_path=env_file, override=False)  # don't overwrite real env vars
+            break
+
+
+_load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Provider Configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    """Configuration for an OpenAI-compatible LLM provider."""
+
+    name: str
+    endpoint: str
+    default_model: str
+    env_var: str
+
+
+PROVIDERS: dict[str, ProviderConfig] = {
+    "groq": ProviderConfig(
+        name="groq",
+        endpoint="https://api.groq.com/openai/v1/chat/completions",
+        default_model="llama-3.3-70b-versatile",
+        env_var="GROQ_API_KEY",
+    ),
+    "deepseek": ProviderConfig(
+        name="deepseek",
+        endpoint="https://api.deepseek.com/chat/completions",
+        default_model="deepseek-chat",
+        env_var="DEEPSEEK_API_KEY",
+    ),
+}
+
+
+def get_active_provider(
+    api_key: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Determine the active LLM provider and resolved API key.
+
+    Checks:
+    1. Explicit provider argument (if given).
+    2. GROQ_API_KEY environment variable (or gsk_ prefixed key).
+    3. DEEPSEEK_API_KEY environment variable (or default DeepSeek key).
+
+    Returns:
+        tuple of (provider_name, api_key_or_none)
+    """
+    if provider:
+        p = provider.lower()
+        env_var = PROVIDERS[p].env_var if p in PROVIDERS else ""
+        key = api_key or (os.environ.get(env_var) if env_var else None)
+        return p, key
+
+    # 1. First check for GROQ_API_KEY environment variable
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if groq_key or (api_key and api_key.startswith("gsk_")):
+        return "groq", api_key or groq_key
+
+    # 2. Check for DEEPSEEK_API_KEY environment variable
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
+    if deepseek_key:
+        return "deepseek", api_key or deepseek_key
+
+    if api_key:
+        return "deepseek", api_key
+
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -44,16 +149,18 @@ def propose_patch(
     breaking_change_info: dict[str, Any],
     api_key: Optional[str] = None,
     model: str = "deepseek-chat",
+    provider: Optional[str] = None,
 ) -> str:
     """Propose a patched replacement for a broken call-site expression.
 
-    Tries the DeepSeek API first; falls back to the deterministic AST engine
-    when the API key is absent or the network call fails.
+    Checks for Groq API first (via ``GROQ_API_KEY``), then DeepSeek API
+    (via ``DEEPSEEK_API_KEY``), and falls back to the deterministic AST
+    engine when no key is present or remote calls fail.
 
     Args:
         code_snippet: The original call expression that needs to be fixed,
             e.g. ``"fetch_user(uid, timeout=30)"``.
-        breaking_change_info: A dictionary describing the change.  Recognised
+        breaking_change_info: A dictionary describing the change. Recognised
             keys (all optional):
 
             * ``"breaking_change"`` – human-readable description of the change.
@@ -63,8 +170,11 @@ def propose_patch(
               prompts.
             * ``"suggested_fix"``   – optional explicit replacement for fallback.
 
-        api_key: Override the ``DEEPSEEK_API_KEY`` environment variable.
-        model: DeepSeek model name (default ``"deepseek-chat"``).
+        api_key: Explicit API key override.
+        model: Model name. Defaults to ``"deepseek-chat"`` (automatically maps to
+            ``"llama-3.3-70b-versatile"`` when Groq is the active provider unless
+            a custom model is specified).
+        provider: Explicit provider override (``"groq"`` or ``"deepseek"``).
 
     Returns:
         The fixed call expression string, or *code_snippet* unchanged when no
@@ -79,20 +189,261 @@ def propose_patch(
     new_signature = breaking_change_info.get("new_signature")
     code_context = str(breaking_change_info.get("code_context", ""))
 
+    # Explicit empty string forces AST engine (used by shims)
+    if api_key == "":
+        return _ast_fallback_patch(
+            call_expression=code_snippet,
+            breaking_change=breaking_change,
+            old_signature=old_signature,
+            new_signature=new_signature,
+        )
+
+    # Determine provider and key
+    active_provider, resolved_key = get_active_provider(api_key=api_key, provider=provider)
+
+    if active_provider == "groq":
+        groq_model = (
+            PROVIDERS["groq"].default_model
+            if model == "deepseek-chat" or not model
+            else model
+        )
+        return _patch_with_groq(
+            call_expression=code_snippet,
+            breaking_change=breaking_change,
+            old_signature=old_signature,
+            new_signature=new_signature,
+            code_context=code_context,
+            api_key=resolved_key,
+            model=groq_model,
+        )
+
+    # 2. Otherwise default to DeepSeek path (checks key or falls back to AST)
+    ds_model = model or PROVIDERS["deepseek"].default_model
     return _patch_with_deepseek(
         call_expression=code_snippet,
         breaking_change=breaking_change,
         old_signature=old_signature,
         new_signature=new_signature,
         code_context=code_context,
-        api_key=api_key,
-        model=model,
+        api_key=resolved_key,
+        model=ds_model,
     )
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek strategy
+# Remote LLM Execution Helpers
 # ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = (
+    "You are SafeDep's automated Python code refactoring engine.\n"
+    "Your sole task is to rewrite a single broken Python call expression or statement to make it compatible with an updated library API.\n"
+    "CRITICAL CONSTRAINTS:\n"
+    "1. Return ONLY the single replacement Python expression or statement.\n"
+    "2. Do NOT output markdown formatting, backticks, explanations, comments, or quotes.\n"
+    "3. Keep all unchanged arguments and expressions exactly as they were.\n"
+    "4. If an existing argument/parameter was renamed or changed to keyword-only, update the keyword name (e.g. from priority=1 to level=1) and preserve its passed value.\n"
+    "5. Ensure the output is valid Python code that can directly replace the original call."
+)
+
+
+def _build_refactor_prompt(
+    call_expression: str,
+    breaking_change: str,
+    old_signature: Optional[str] = None,
+    new_signature: Optional[str] = None,
+    code_context: str = "",
+) -> str:
+    """Construct the standardized refactoring prompt."""
+    parts = [
+        f"API Breaking Change: {breaking_change}",
+        f"Original Call Expression: {call_expression}",
+    ]
+    if old_signature:
+        parts.append(f"Old API Signature: {old_signature}")
+    if new_signature:
+        parts.append(f"New API Signature: {new_signature}")
+    if code_context:
+        parts.append(f"Surrounding Code Context:\n{code_context}")
+
+    parts.append(
+        "Instruction: Rewrite the original call expression to adhere to the new API signature. "
+        "Return ONLY the single fixed Python call expression or statement. Nothing else."
+    )
+    return "\n".join(parts)
+
+
+def _clean_model_response(raw_text: str) -> str:
+    """Clean and extract single Python statement from LLM response."""
+    cleaned = raw_text.strip()
+    # Remove markdown code blocks if any
+    cleaned = re.sub(r"^```(?:python)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = cleaned.strip()
+    # Strip any accidental wrapping quotes if the whole line is quoted
+    if (cleaned.startswith('"') and cleaned.endswith('"')) or (
+        cleaned.startswith("'") and cleaned.endswith("'")
+    ):
+        inner = cleaned[1:-1].strip()
+        if "(" in inner and ")" in inner:
+            cleaned = inner
+    return cleaned
+
+
+def _execute_chat_completion(
+    endpoint: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    timeout: float = 15.0,
+    system_prompt: str = _SYSTEM_PROMPT,
+) -> Optional[str]:
+    """Execute an OpenAI-compatible chat completion HTTP request."""
+    models_to_try = [model]
+    # If using Groq and the default model llama-3.3-70b-versatile is decommissioned or unavailable,
+    # gracefully fall back to the top available open-weights models on Groq
+    if "groq.com" in endpoint and model == "llama-3.3-70b-versatile":
+        for fallback_m in ("openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"):
+            if fallback_m not in models_to_try:
+                models_to_try.append(fallback_m)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "SafeDep/0.5.0",
+    }
+
+    for m in models_to_try:
+        req_payload = {
+            "model": m,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+        }
+
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(req_payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp_json = json.loads(resp.read().decode("utf-8"))
+                result_text = resp_json["choices"][0]["message"]["content"]
+                cleaned = _clean_model_response(result_text)
+                if cleaned:
+                    return cleaned
+        except urllib.error.HTTPError as err:
+            # If 404 or 400 (model decommissioned/not found), try next model candidate in list
+            if err.code in (400, 404) and len(models_to_try) > 1:
+                continue
+            pass
+        except Exception:
+            pass
+
+    return None
+
+
+def _call_groq_sdk(
+    api_key: str,
+    model: str,
+    prompt: str,
+    system_prompt: str = _SYSTEM_PROMPT,
+    timeout: float = 15.0,
+) -> Optional[str]:
+    """Execute completion using official `groq` package if installed."""
+    try:
+        import groq  # type: ignore[import]
+    except ImportError:
+        return None
+
+    models_to_try = [model]
+    if model == "llama-3.3-70b-versatile":
+        for fallback_m in ("openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"):
+            if fallback_m not in models_to_try:
+                models_to_try.append(fallback_m)
+
+    try:
+        client = groq.Groq(api_key=api_key, timeout=timeout)
+        for m in models_to_try:
+            try:
+                chat_completion = client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    model=m,
+                    temperature=0.0,
+                )
+                if chat_completion.choices and chat_completion.choices[0].message.content:
+                    return _clean_model_response(chat_completion.choices[0].message.content)
+            except Exception as e:
+                status = getattr(e, "status_code", None)
+                if status in (400, 404) and len(models_to_try) > 1:
+                    continue
+                break
+    except Exception:
+        pass
+
+    return None
+
+
+def _patch_with_groq(
+    call_expression: str,
+    breaking_change: str,
+    old_signature: Optional[str] = None,
+    new_signature: Optional[str] = None,
+    code_context: str = "",
+    api_key: Optional[str] = None,
+    model: str = "llama-3.3-70b-versatile",
+) -> str:
+    """Request a refactoring patch using Groq's API.
+    
+    Tries the official `groq` SDK first if available, then urllib HTTP request,
+    and falls back to the deterministic AST engine.
+    """
+    effective_key = api_key or os.environ.get("GROQ_API_KEY")
+    if effective_key:
+        prompt = _build_refactor_prompt(
+            call_expression=call_expression,
+            breaking_change=breaking_change,
+            old_signature=old_signature,
+            new_signature=new_signature,
+            code_context=code_context,
+        )
+        
+        # 1. Prefer official `groq` Python package if available
+        # (Skipped if urllib is specifically mocked during testing)
+        sdk_res = _call_groq_sdk(
+            api_key=effective_key,
+            model=model,
+            prompt=prompt,
+        )
+        if sdk_res:
+            return sdk_res
+
+        # 2. Pure urllib HTTP fallback (OpenAI-compatible)
+        result = _execute_chat_completion(
+            endpoint=PROVIDERS["groq"].endpoint,
+            api_key=effective_key,
+            model=model,
+            prompt=prompt,
+        )
+        if result:
+            return result
+
+    # Fallback to AST engine on missing key or network failure
+    return _ast_fallback_patch(
+        call_expression,
+        breaking_change,
+        old_signature,
+        new_signature,
+    )
 
 
 def _patch_with_deepseek(
@@ -104,70 +455,26 @@ def _patch_with_deepseek(
     api_key: Optional[str] = None,
     model: str = "deepseek-chat",
 ) -> str:
-    """Request a signature refactoring patch from the DeepSeek API.
+    """Request a refactoring patch using DeepSeek API."""
+    effective_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+    if effective_key:
+        prompt = _build_refactor_prompt(
+            call_expression=call_expression,
+            breaking_change=breaking_change,
+            old_signature=old_signature,
+            new_signature=new_signature,
+            code_context=code_context,
+        )
+        result = _execute_chat_completion(
+            endpoint=PROVIDERS["deepseek"].endpoint,
+            api_key=effective_key,
+            model=model,
+            prompt=prompt,
+        )
+        if result:
+            return result
 
-    Uses the OpenAI-compatible DeepSeek chat completions endpoint.
-    Falls back to :func:`_ast_fallback_patch` on any error.
-    """
-    effective_api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
-
-    if effective_api_key:
-        try:
-            prompt = (
-                "You are SafeDep's automated Python refactoring engine.\n"
-                f"Issue / Breaking Change: {breaking_change}\n\n"
-                f"Original Call Expression / Statement: {call_expression}\n"
-                f"Old Signature: {old_signature or 'N/A'}\n"
-                f"New Signature: {new_signature or 'N/A'}\n"
-            )
-            if code_context:
-                prompt += f"\nCode Context:\n```python\n{code_context}\n```\n"
-
-            prompt += (
-                "\nProvide ONLY the replacement Python line / expression that fixes the issue.\n"
-                "Return only the single fixed Python expression/statement, with no markdown code blocks or explanations."
-            )
-
-            req_payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an automated Python refactoring tool. "
-                            "Output ONLY the corrected single line Python call expression or statement."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.0,
-            }
-
-            url = "https://api.deepseek.com/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {effective_api_key}",
-            }
-
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(req_payload).encode("utf-8"),
-                headers=headers,
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                resp_json = json.loads(resp.read().decode("utf-8"))
-                result_text = resp_json["choices"][0]["message"]["content"].strip()
-                # Strip any markdown fences the model may have included
-                result_text = re.sub(r"^```python\s*", "", result_text)
-                result_text = re.sub(r"^```\s*", "", result_text)
-                result_text = re.sub(r"```$", "", result_text).strip()
-                if result_text:
-                    return result_text
-        except Exception:
-            # Network or API error — fall through to the AST engine
-            pass
-
+    # Fallback to AST engine on missing key or network failure
     return _ast_fallback_patch(
         call_expression,
         breaking_change,
@@ -204,6 +511,7 @@ def _ast_fallback_patch(
     suggest_match = re.search(r"\[(?:SUGGESTED_FIX|REPLACE)\]\s*(.+)$", breaking_change)
     if suggest_match:
         return suggest_match.group(1).strip()
+
     clean_expr = call_expression.strip()
     if not clean_expr:
         return clean_expr
@@ -284,4 +592,3 @@ def _ast_fallback_patch(
             return ast.unparse(call_node)
 
     return clean_expr
-

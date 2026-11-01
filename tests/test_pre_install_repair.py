@@ -102,7 +102,7 @@ def query(sql: str, timeout: int = 10) -> list:
                 dir_path,
                 "v2.py",
                 """
-# calculate_tax removed (behavioral)
+# calculate_tax removed
 def query(sql: str) -> list:  # timeout removed (syntactical)
     return []
 """,
@@ -129,13 +129,18 @@ def run_app():
             self.assertIn("query", fn_names)
             self.assertIn("calculate_tax", fn_names)
 
-            # query should have a patch that removes the timeout argument
+            # query should have a real code patch that removes the timeout argument
             query_issue = next(i for i in report.syntactical_issues if i.function_name == "query")
             self.assertEqual(query_issue.proposed_fix, "query('SELECT 1')")
+            self.assertFalse(query_issue.is_removal)
 
-            # calculate_tax is removed — proposed_fix should be a guidance message, not a code patch
+            # calculate_tax is removed — proposed_fix must be None (no invalid code patch)
             tax_issue = next(i for i in report.syntactical_issues if i.function_name == "calculate_tax")
-            self.assertIn("no longer exists", tax_issue.proposed_fix)
+            self.assertIsNone(tax_issue.proposed_fix)
+            self.assertTrue(tax_issue.is_removal)
+            # patch_diff should contain a safe commented-out suggestion, not an English sentence
+            self.assertIn("calculate_tax", tax_issue.patch_diff)
+            self.assertTrue(tax_issue.patch_diff.startswith("#"))
 
     def test_format_pre_install_report_content(self):
         """Test that the report contains all required headers and explanatory notes."""
@@ -152,10 +157,38 @@ def run_app():
 
             # Verify required reporting elements
             self.assertIn("Total issues found:", formatted)
-            self.assertIn("Syntactical / signature issues (fixable now):", formatted)
+            self.assertIn("Auto-fixable signature changes:", formatted)
+            self.assertIn("Removed functions/methods (manual intervention):", formatted)
             self.assertIn("Behavioral / structural issues (deferred):", formatted)
             self.assertIn("IMPORTANT NOTE ON BEHAVIORAL ISSUES:", formatted)
             self.assertIn("CAN ONLY BE DETECTED AND VERIFIED AFTER INSTALLATION", formatted)
+            # Removal section should say manual intervention
+            self.assertIn("MANUAL INTERVENTION REQUIRED", formatted)
+            # Auto-fix section should be present for query's timeout removal
+            self.assertIn("AUTO-FIXABLE SIGNATURE CHANGES", formatted)
+
+    def test_apply_fixes_skips_removals(self):
+        """Verify apply_fixes never writes English text (or any patch) for removed functions."""
+        with tempfile.TemporaryDirectory() as td:
+            dir_path = Path(td)
+            old_file = self._write_file(dir_path, "v1.py", "def old_fn(): pass\ndef query(sql, timeout=10): pass")
+            new_file = self._write_file(dir_path, "v2.py", "def query(sql): pass")
+            client_file = self._write_file(
+                dir_path, "app.py", "def run():\n    old_fn()\n    query('SELECT *', timeout=5)"
+            )
+
+            report = run_pre_install_repair(old_file, new_file, client_file, action="apply_only")
+            content = client_file.read_text(encoding="utf-8")
+
+            # old_fn is removed — the original call line must NOT be replaced with English text
+            self.assertIn("old_fn()", content, "removed call should remain in file (not replaced with English)")
+            self.assertNotIn("no longer exists", content)
+            self.assertNotIn("Remove this call", content)
+            self.assertNotIn("manual replacement required", content)
+
+            # query's timeout arg should have been removed (it's an auto-fixable change)
+            self.assertNotIn("timeout=5", content)
+            self.assertIn("query('SELECT *')", content)
 
     def test_apply_fixes_only(self):
         """Test Option 2: Apply fixes only without installing the new library."""

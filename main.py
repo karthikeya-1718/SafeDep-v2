@@ -17,6 +17,34 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+# ---------------------------------------------------------------------------
+# Load .env file early — before any os.environ reads
+# ---------------------------------------------------------------------------
+
+def _load_dotenv_early() -> None:
+    """Load the nearest .env file into the environment.
+
+    Searches SafeDep/ then d:\\AIML_Project\\ so that GROQ_API_KEY /
+    DEEPSEEK_API_KEY are visible to the CLI and all sub-modules.
+    """
+    try:
+        from dotenv import load_dotenv  # type: ignore[import]
+    except ImportError:
+        return  # python-dotenv not installed — skip silently
+
+    search_dirs = [
+        Path(__file__).resolve().parent,         # SafeDep/
+        Path(__file__).resolve().parent.parent,  # d:\AIML_Project\
+    ]
+    for directory in search_dirs:
+        env_file = directory / ".env"
+        if env_file.is_file():
+            load_dotenv(dotenv_path=env_file, override=False)
+            break
+
+
+_load_dotenv_early()
+
 # Ensure project root is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -194,9 +222,13 @@ def _validate_path(path_str: str, label: str) -> Path:
 
 
 def _check_api_key_notice() -> None:
-    """Print an informative notice if DEEPSEEK_API_KEY is not set."""
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        print("[INFO] DEEPSEEK_API_KEY is not set in environment.")
+    """Print an informative notice showing the active LLM provider or AST fallback."""
+    if os.environ.get("GROQ_API_KEY"):
+        print("[INFO] GROQ_API_KEY detected. Using Groq LLM (llama-3.3-70b-versatile).\n")
+    elif os.environ.get("DEEPSEEK_API_KEY"):
+        print("[INFO] DEEPSEEK_API_KEY detected. Using DeepSeek LLM (deepseek-chat).\n")
+    else:
+        print("[INFO] No remote LLM API key detected (GROQ_API_KEY or DEEPSEEK_API_KEY).")
         print("       SafeDep will use its offline deterministic AST refactoring engine.\n")
 
 

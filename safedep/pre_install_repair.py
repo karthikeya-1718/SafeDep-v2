@@ -50,6 +50,7 @@ class RepairIssue:
     proposed_fix: Optional[str] = None
     patch_diff: Optional[str] = None
     explanation: str = ""
+    is_removal: bool = False  # True when the function/method no longer exists at all
 
 
 @dataclass
@@ -68,8 +69,12 @@ class PreInstallRepairReport:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert report to dictionary format."""
+        auto_fixable = [i for i in self.syntactical_issues if not i.is_removal]
+        manual_required = [i for i in self.syntactical_issues if i.is_removal]
         return {
             "total_issues": self.total_issues,
+            "auto_fixable_signature_changes": len(auto_fixable),
+            "manual_intervention_required": len(manual_required),
             "syntactical_issues_fixable_now": self.syntactical_count,
             "behavioral_issues_deferred": self.behavioral_count,
             "syntactical_issues": [
@@ -84,6 +89,7 @@ class PreInstallRepairReport:
                     "call_expression": i.call_expression,
                     "proposed_fix": i.proposed_fix,
                     "patch_diff": i.patch_diff,
+                    "is_removal": i.is_removal,
                 }
                 for i in self.syntactical_issues
             ],
@@ -114,12 +120,12 @@ def classify_issue(call_site: dict[str, Any], diff_result: dict[str, Any]) -> tu
 
     Behavioral issues are ONLY those where a function still exists but its runtime
     behavior, return values, or side effects may have changed in ways not visible
-    from the signature/API diff alone — not detectable pre-installation.
+    from the signature/API diff alone -- not detectable pre-installation.
     """
     callee = str(call_site.get("callee_name") or call_site.get("function_name", ""))
     breaking_text = str(call_site.get("breaking_change", ""))
 
-    # 1. Explicitly removed functions — detectable and flaggable pre-install
+    # 1. Explicitly removed functions -- detectable and flaggable pre-install
     for fn in diff_result.get("removed_functions", []):
         if fn.get("name") == callee:
             return "syntactical", None
@@ -148,7 +154,7 @@ def classify_issue(call_site: dict[str, Any], diff_result: dict[str, Any]) -> tu
     ):
         return "syntactical", None
 
-    # 6. Only defer to behavioral if no structural evidence found in the diff —
+    # 6. Only defer to behavioral if no structural evidence found in the diff --
     #    i.e., the function still exists but may behave differently at runtime.
     return "behavioral", None
 
@@ -170,7 +176,7 @@ def generate_patch_with_deepseek(
     api_key: Optional[str] = None,
     model: str = "deepseek-chat",
 ) -> str:
-    """Thin shim — delegates to :func:`safedep.patcher.propose_patch`.
+    """Thin shim -- delegates to :func:`safedep.patcher.propose_patch`.
 
     .. deprecated::
         Import :func:`safedep.patcher.propose_patch` directly instead.
@@ -194,7 +200,7 @@ def generate_fallback_patch(
     old_signature: Optional[str] = None,
     new_signature: Optional[str] = None,
 ) -> str:
-    """Thin shim — delegates to the AST fallback inside :mod:`safedep.patcher`.
+    """Thin shim -- delegates to the AST fallback inside :mod:`safedep.patcher`.
 
     .. deprecated::
         Import :func:`safedep.patcher.propose_patch` directly instead.
@@ -207,7 +213,7 @@ def generate_fallback_patch(
             "old_signature": old_signature,
             "new_signature": new_signature,
         },
-        api_key="",  # empty string → skip DeepSeek, go straight to AST engine
+        api_key="",  # empty string -- skip DeepSeek, go straight to AST engine
     )
 
 
@@ -278,8 +284,7 @@ def analyze_pre_install_issues(
 
         if issue_type == "syntactical":
             # Determine whether this is a removal vs. a signature change.
-            # Removed symbols cannot be patched to a valid call — provide a
-            # descriptive guidance message instead of generating a code patch.
+            # Removed symbols cannot be auto-patched to a valid call expression.
             is_removal = (
                 any(fn.get("name") == callee for fn in diff_result.get("removed_functions", []))
                 or any(cls.get("name") == callee for cls in diff_result.get("removed_classes", []))
@@ -290,7 +295,10 @@ def analyze_pre_install_issues(
             )
 
             if is_removal:
-                proposed_fix = f"Remove this call or replace with an alternative (`{callee}` no longer exists in new version)"
+                # Do NOT produce a code patch -- inserting English text into source is invalid Python.
+                # A commented-out line is provided as a safe, non-breaking suggestion.
+                proposed_fix = None
+                patch_diff = f"# {expr}  # TODO: `{callee}` was removed -- manual replacement required"
             else:
                 # Extract surrounding context if file exists
                 lines = get_lines(fp)
@@ -300,7 +308,7 @@ def analyze_pre_install_issues(
                     end = min(len(lines), line_no + 3)
                     ctx = "".join(lines[start:end])
 
-                # Generate fix via patcher (DeepSeek API with AST fallback)
+                # Generate fix via patcher (LLM API with AST fallback)
                 proposed_fix = propose_patch(
                     code_snippet=expr,
                     breaking_change_info={
@@ -313,10 +321,10 @@ def analyze_pre_install_issues(
                     model=deepseek_model,
                 )
 
-            # Generate unified diff preview
-            patch_diff = ""
-            if expr and proposed_fix and expr != proposed_fix:
-                patch_diff = f"- {expr}\n+ {proposed_fix}"
+                # Generate inline diff preview only when we have a real code change
+                patch_diff = ""
+                if expr and proposed_fix and expr != proposed_fix:
+                    patch_diff = f"- {expr}\n+ {proposed_fix}"
 
             syntactical_issues.append(
                 RepairIssue(
@@ -333,6 +341,7 @@ def analyze_pre_install_issues(
                     new_signature=new_sig,
                     proposed_fix=proposed_fix,
                     patch_diff=patch_diff,
+                    is_removal=is_removal,
                 )
             )
         else:
@@ -376,6 +385,10 @@ def analyze_pre_install_issues(
         # Sort issues by line number in reverse order to avoid line shifting
         sorted_issues = sorted(issues, key=lambda x: x.line_number, reverse=True)
         for iss in sorted_issues:
+            # Never apply a patch for removals -- no valid replacement call can be generated.
+            # The commented-out suggestion in patch_diff is for the report only.
+            if iss.is_removal:
+                continue
             if not iss.proposed_fix or not iss.call_expression:
                 continue
             idx = iss.line_number - 1
@@ -418,29 +431,33 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
     border = "=" * 70
     sub_border = "-" * 70
 
+    auto_fixable = [i for i in report.syntactical_issues if not i.is_removal]
+    manual_required = [i for i in report.syntactical_issues if i.is_removal]
+
     lines = [
         border,
         "  SAFEDEP - PRE-INSTALL REPAIR REPORT",
         border,
         "SUMMARY:",
         f"  * Total issues found:                                 {report.total_issues}",
-        f"  * Syntactical / signature issues (fixable now):       {report.syntactical_count}",
+        f"  * Auto-fixable signature changes:                     {len(auto_fixable)}",
+        f"  * Removed functions/methods (manual intervention):    {len(manual_required)}",
         f"  * Behavioral / structural issues (deferred):          {report.behavioral_count}",
         sub_border,
         "IMPORTANT NOTE ON BEHAVIORAL ISSUES:",
         "  [!] Behavioral and semantic issues (e.g., altered return value ranges,",
-        "      internal algorithm modifications, runtime exceptions, removed functions)",
+        "      internal algorithm modifications, runtime exceptions)",
         "      cannot be safely fixed pre-installation without running the software.",
         "      These issues CAN ONLY BE DETECTED AND VERIFIED AFTER INSTALLATION",
         "      by running the client project's unit and integration test suite.",
         sub_border,
     ]
 
-    # Section 1: Fixable Syntactical Issues
-    if report.syntactical_issues:
-        lines.append(f"\n[+] FIXABLE SYNTACTICAL / SIGNATURE-LEVEL ISSUES ({report.syntactical_count}):")
-        lines.append("    (Patches generated via DeepSeek / AST Refactoring Engine)\n")
-        for idx, iss in enumerate(report.syntactical_issues, 1):
+    # Section 1a: Auto-fixable signature changes
+    if auto_fixable:
+        lines.append(f"\n[+] AUTO-FIXABLE SIGNATURE CHANGES ({len(auto_fixable)}):")
+        lines.append("    (Patches generated via LLM / AST Refactoring Engine)\n")
+        for idx, iss in enumerate(auto_fixable, 1):
             fname = Path(iss.file_path).name
             lines.append(f"  {idx}. [{iss.risk_level}] `{iss.function_name}` in {fname}:{iss.line_number}")
             lines.append(f"     Caller:       `{iss.caller_name}()`")
@@ -450,6 +467,23 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
                 lines.append(f"     Proposed Fix: {iss.proposed_fix}")
             if iss.patch_diff:
                 lines.append(f"     Patch Diff:   {iss.patch_diff.replace(chr(10), ' | ')}")
+            lines.append("")
+
+    # Section 1b: Removed functions/methods -- cannot be auto-fixed
+    if manual_required:
+        lines.append(f"\n[x] REMOVED FUNCTIONS / METHODS -- MANUAL INTERVENTION REQUIRED ({len(manual_required)}):")
+        lines.append("    (Cannot auto-fix safely: the function no longer exists in the new version.")
+        lines.append("     The original call is shown below. Replace or remove it manually.)\n")
+        for idx, iss in enumerate(manual_required, 1):
+            fname = Path(iss.file_path).name
+            lines.append(f"  {idx}. [{iss.risk_level}] `{iss.function_name}` in {fname}:{iss.line_number}")
+            lines.append(f"     Caller:   `{iss.caller_name}()`")
+            lines.append(f"     Issue:    `{iss.function_name}` was removed -- no replacement call can be generated.")
+            lines.append(f"     Old Call: {iss.call_expression}")
+            lines.append(f"     Status:   Cannot auto-fix safely -- manual replacement or removal required.")
+            if iss.patch_diff:
+                lines.append(f"     Safe Suggestion: Comment out the line -->")
+                lines.append(f"       {iss.patch_diff}")
             lines.append("")
 
     # Section 2: Behavioral / Deferred Issues
@@ -464,11 +498,14 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
             lines.append(f"     Status:   DEFERRED -> Post-install test verification required.")
             lines.append("")
 
-    # Section 3: File Diffs
-    if report.unified_diffs:
+    # Section 3: File Diffs (only for auto-fixable changes)
+    auto_fix_diffs = {
+        fp: diff for fp, diff in report.unified_diffs.items() if diff.strip()
+    }
+    if auto_fix_diffs:
         lines.append(sub_border)
-        lines.append("GENERATED UNIFIED DIFFS:")
-        for fp, diff in report.unified_diffs.items():
+        lines.append("GENERATED UNIFIED DIFFS (auto-fixable changes only):")
+        for fp, diff in auto_fix_diffs.items():
             lines.append(f"\n--- {fp} ---")
             lines.append(diff.strip())
 

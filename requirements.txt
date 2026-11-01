@@ -1,6 +1,9 @@
 # SafeDep Core runs with zero external runtime dependencies (Python >= 3.9)
 # Standard library modules used: ast, dataclasses, pathlib, argparse, json, sys, os
 
+# .env file support (load GROQ_API_KEY / DEEPSEEK_API_KEY from .env)
+python-dotenv>=1.0.0
+
 # Development & Testing (Optional)
 pytest>=7.0.0
 pytest-cov>=4.0.0

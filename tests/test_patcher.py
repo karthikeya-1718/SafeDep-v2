@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -10,7 +12,14 @@ from unittest.mock import MagicMock, patch
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from safedep.patcher import _ast_fallback_patch, _patch_with_deepseek, propose_patch
+from safedep.patcher import (
+    PROVIDERS,
+    _ast_fallback_patch,
+    _patch_with_deepseek,
+    _patch_with_groq,
+    get_active_provider,
+    propose_patch,
+)
 
 
 class TestAstFallbackPatch(unittest.TestCase):
@@ -93,6 +102,16 @@ class TestAstFallbackPatch(unittest.TestCase):
 class TestProposePatch(unittest.TestCase):
     """Tests for the public propose_patch() entry-point."""
 
+    def setUp(self):
+        # Ensure clean environment for each test
+        self._orig_env = os.environ.copy()
+        os.environ.pop("GROQ_API_KEY", None)
+        os.environ.pop("DEEPSEEK_API_KEY", None)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._orig_env)
+
     def test_delegates_to_ast_fallback_without_api_key(self):
         """Without an API key, propose_patch uses the AST engine."""
         result = propose_patch(
@@ -133,7 +152,7 @@ class TestProposePatch(unittest.TestCase):
         self.assertIn("def bar", captured["code_context"])
 
     def test_returns_deepseek_result_when_api_key_present(self):
-        """When the API responds, propose_patch returns that result."""
+        """When the DeepSeek API responds, propose_patch returns that result."""
         mock_resp_data = b'{"choices": [{"message": {"content": "fixed_call()"}}]}'
 
         mock_response = MagicMock()
@@ -182,6 +201,145 @@ class TestProposePatch(unittest.TestCase):
         self.assertEqual(result, "fixed()")
 
 
+class TestMultiProviderSupport(unittest.TestCase):
+    """Tests for Groq and DeepSeek provider selection and execution."""
+
+    def setUp(self):
+        self._orig_env = os.environ.copy()
+        os.environ.pop("GROQ_API_KEY", None)
+        os.environ.pop("DEEPSEEK_API_KEY", None)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._orig_env)
+
+    def test_groq_used_when_groq_api_key_set(self):
+        """When GROQ_API_KEY is present, Groq endpoint and llama model are used."""
+        os.environ["GROQ_API_KEY"] = "gsk_test123"
+
+        captured_req: dict = {}
+
+        def mock_urlopen(req, timeout=15):
+            captured_req["url"] = req.full_url
+            captured_req["auth"] = req.headers.get("Authorization")
+            payload = json.loads(req.data.decode("utf-8"))
+            captured_req["model"] = payload["model"]
+
+            resp = MagicMock()
+            resp.read.return_value = b'{"choices": [{"message": {"content": "groq_fixed()"}}]}'
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            res = propose_patch(
+                code_snippet="old_func()",
+                breaking_change_info={"breaking_change": "some change"},
+            )
+
+        self.assertEqual(res, "groq_fixed()")
+        self.assertEqual(captured_req["url"], "https://api.groq.com/openai/v1/chat/completions")
+        self.assertEqual(captured_req["auth"], "Bearer gsk_test123")
+        self.assertEqual(captured_req["model"], "llama-3.3-70b-versatile")
+
+    def test_groq_custom_model_option(self):
+        """Groq respects custom models such as openai/gpt-oss-20b."""
+        os.environ["GROQ_API_KEY"] = "gsk_test123"
+
+        captured_model = []
+
+        def mock_urlopen(req, timeout=15):
+            payload = json.loads(req.data.decode("utf-8"))
+            captured_model.append(payload["model"])
+            resp = MagicMock()
+            resp.read.return_value = b'{"choices": [{"message": {"content": "fixed()"}}]}'
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            propose_patch(
+                code_snippet="old_func()",
+                breaking_change_info={"breaking_change": "some change"},
+                model="openai/gpt-oss-20b",
+            )
+
+        self.assertEqual(captured_model[0], "openai/gpt-oss-20b")
+
+    def test_groq_preferred_over_deepseek_when_both_keys_present(self):
+        """When both GROQ_API_KEY and DEEPSEEK_API_KEY are set, Groq takes precedence."""
+        os.environ["GROQ_API_KEY"] = "gsk_groq"
+        os.environ["DEEPSEEK_API_KEY"] = "ds_deepseek"
+
+        captured_url = []
+
+        def mock_urlopen(req, timeout=15):
+            captured_url.append(req.full_url)
+            resp = MagicMock()
+            resp.read.return_value = b'{"choices": [{"message": {"content": "fixed()"}}]}'
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            propose_patch("call()", {"breaking_change": "change"})
+
+        self.assertEqual(captured_url[0], "https://api.groq.com/openai/v1/chat/completions")
+
+    def test_deepseek_used_when_only_deepseek_key_present(self):
+        """When only DEEPSEEK_API_KEY is present, DeepSeek is used."""
+        os.environ["DEEPSEEK_API_KEY"] = "ds_deepseek"
+
+        captured_url = []
+
+        def mock_urlopen(req, timeout=15):
+            captured_url.append(req.full_url)
+            resp = MagicMock()
+            resp.read.return_value = b'{"choices": [{"message": {"content": "fixed()"}}]}'
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            propose_patch("call()", {"breaking_change": "change"})
+
+        self.assertEqual(captured_url[0], "https://api.deepseek.com/chat/completions")
+
+    def test_groq_falls_back_to_ast_on_network_error(self):
+        """When Groq network request fails, it falls back to the AST engine."""
+        import urllib.error
+
+        os.environ["GROQ_API_KEY"] = "gsk_test123"
+
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection reset")):
+            result = propose_patch(
+                code_snippet="query(sql, timeout=5)",
+                breaking_change_info={"breaking_change": "Parameter 'timeout' was removed"},
+            )
+
+        self.assertEqual(result, "query(sql)")
+
+    def test_explicit_provider_override(self):
+        """Passing provider='deepseek' explicitly overrides GROQ_API_KEY."""
+        os.environ["GROQ_API_KEY"] = "gsk_groq"
+        os.environ["DEEPSEEK_API_KEY"] = "ds_deepseek"
+
+        captured_url = []
+
+        def mock_urlopen(req, timeout=15):
+            captured_url.append(req.full_url)
+            resp = MagicMock()
+            resp.read.return_value = b'{"choices": [{"message": {"content": "fixed()"}}]}'
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            propose_patch("call()", {"breaking_change": "change"}, provider="deepseek")
+
+        self.assertEqual(captured_url[0], "https://api.deepseek.com/chat/completions")
+
+
 class TestBackwardsCompatShims(unittest.TestCase):
     """Verify the shim functions in pre_install_repair still work after refactor."""
 
@@ -207,4 +365,3 @@ class TestBackwardsCompatShims(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

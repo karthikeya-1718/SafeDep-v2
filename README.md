@@ -22,7 +22,8 @@
 - **Explainable Risk Scoring**: Prioritizes call sites using call frequency and call chain depth (`risk_score = call_count * depth`), categorizing issues from LOW to CRITICAL.
 - **Dual-Phase Automated Repair**:
   - **Pre-Install Repair**: Patches signature and syntactical breaking changes before upgrading the library.
-  - **Post-Install Repair**: Runs test suite via `pytest` to detect behavioral changes, proposes candidate fixes via DeepSeek AI / AST engine, and applies strictly **test-gated** patches with automatic rollback if tests fail.
+  - **Post-Install Repair**: Runs test suite via `pytest` to detect behavioral changes, proposes candidate fixes via Groq/DeepSeek AI or deterministic AST engine, and applies strictly **test-gated** patches with automatic rollback if tests fail.
+- **Multi-Provider AI & AST Engine**: Supports ultra-fast inference with Groq (`llama-3.3-70b-versatile`, `openai/gpt-oss-20b`) and DeepSeek (`deepseek-chat`), with automatic offline fallback to Python AST manipulation.
 
 ---
 
@@ -34,7 +35,7 @@ SafeDep/
 │   ├── __init__.py           # Package exports and version metadata (v0.5.0)
 │   ├── api_diff.py           # Core AST diffing engine (get_breaking_changes)
 │   ├── call_graph.py         # Call graph builder & call-site locator
-│   ├── patcher.py            # Shared patch engine (DeepSeek AI & AST fallback)
+│   ├── patcher.py            # Shared patch engine (Groq, DeepSeek & AST fallback)
 │   ├── risk_ranker.py        # Risk scoring & prioritization engine
 │   ├── pre_install_repair.py # Pre-install repair orchestrator (signature-level)
 │   ├── post_install_repair.py# Post-install repair orchestrator (test-gated)
@@ -43,7 +44,7 @@ SafeDep/
 │   ├── __init__.py
 │   ├── test_api_diff.py      # Unit tests for API diffing (16 tests)
 │   ├── test_call_graph.py    # Unit tests for call graph (14 tests)
-│   ├── test_patcher.py       # Unit tests for patch generator (18 tests)
+│   ├── test_patcher.py       # Unit tests for multi-provider patcher (24 tests)
 │   ├── test_risk_ranker.py   # Unit tests for risk scoring (8 tests)
 │   ├── test_pre_install_repair.py  # Unit tests for pre-install repair (8 tests)
 │   └── test_post_install_repair.py # Unit tests for post-install repair (8 tests)
@@ -69,14 +70,14 @@ SafeDep/
    pip install -r requirements.txt
    ```
 
-4. **DeepSeek API Key (Optional)**:
-   To enable AI-powered refactoring, set `DEEPSEEK_API_KEY`:
+4. **LLM Provider API Keys (Optional)**:
+   To enable AI-powered refactoring, configure either **Groq** or **DeepSeek**:
    ```bash
-   # Linux / macOS
-   export DEEPSEEK_API_KEY="your-api-key"
+   # Option A: Groq API (Checked first; default model: llama-3.3-70b-versatile)
+   export GROQ_API_KEY="gsk_your_groq_api_key"
 
-   # Windows PowerShell
-   $env:DEEPSEEK_API_KEY="your-api-key"
+   # Option B: DeepSeek API (Checked second; model: deepseek-chat)
+   export DEEPSEEK_API_KEY="sk_your_deepseek_api_key"
    ```
    *Note: If no API key is set, SafeDep automatically uses its built-in deterministic AST refactoring engine.*
 
@@ -261,7 +262,7 @@ print(format_post_install_report(post_report))
 
 ## Running Unit Tests
 
-Run the full automated test suite (72 unit tests across 6 test modules):
+Run the full automated test suite (78 unit tests across 6 test modules):
 
 ```bash
 # Run all unit tests via unittest discover
