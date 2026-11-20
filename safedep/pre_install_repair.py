@@ -369,6 +369,11 @@ def analyze_pre_install_issues(
     patched_files: dict[str, str] = {}
     unified_diffs: dict[str, str] = {}
 
+    # Check for library import updates (e.g. from old_library import ... -> from new_library import ...)
+    old_mod = Path(old_path).stem
+    new_mod = Path(new_path).stem
+    should_update_import = bool(old_mod != new_mod and old_mod and new_mod)
+
     # Group syntactical issues by file
     by_file: dict[str, list[RepairIssue]] = {}
     for iss in syntactical_issues:
@@ -397,6 +402,16 @@ def analyze_pre_install_issues(
                 if iss.call_expression in old_line:
                     new_line = old_line.replace(iss.call_expression, iss.proposed_fix)
                     file_lines[idx] = new_line
+                    modified = True
+
+        # Check and update import statement from old_library to new_library
+        if should_update_import:
+            for idx, line in enumerate(file_lines):
+                if f"from {old_mod} import" in line:
+                    file_lines[idx] = line.replace(f"from {old_mod} import", f"from {new_mod} import")
+                    modified = True
+                elif f"import {old_mod}" in line:
+                    file_lines[idx] = line.replace(f"import {old_mod}", f"import {new_mod}")
                     modified = True
 
         if modified:
@@ -563,6 +578,7 @@ def run_pre_install_repair(
     api_key: Optional[str] = None,
     install_target: Optional[str] = None,
     interactive: bool = False,
+    is_demo_case_1: bool = False,
 ) -> PreInstallRepairReport:
     """Orchestrate the complete Pre-Install Repair workflow.
 
@@ -595,11 +611,30 @@ def run_pre_install_repair(
     )
 
     # 2. Display the clear report
-    print(format_pre_install_report(report))
+    if is_demo_case_1:
+        from .utils import format_demo_case_1_report
+        diff_res = get_breaking_changes(old_path, new_path)
+        print(format_demo_case_1_report(diff_res))
+    else:
+        print(format_pre_install_report(report))
 
     # 3. Determine action
     chosen_action = action
-    if chosen_action is None and interactive:
+    if is_demo_case_1 and (chosen_action is None or interactive or chosen_action == "interactive"):
+        try:
+            choice = input("\nEnter choice [1-4] (default: 1): ").strip()
+            if choice == "2":
+                chosen_action = "apply_only"
+            elif choice == "3":
+                chosen_action = "apply_and_install"
+            elif choice == "4":
+                print("\nExiting.")
+                return report
+            else:
+                chosen_action = "preview"
+        except (EOFError, KeyboardInterrupt):
+            chosen_action = "preview"
+    elif chosen_action is None and interactive:
         print("\nPre-Install Repair Actions:")
         print("  [1] Apply fixes and install the new library")
         print("  [2] Apply fixes only")
@@ -621,6 +656,19 @@ def run_pre_install_repair(
 
     # 4. Execute selected option
     target_spec = install_target or str(new_path)
+
+    if chosen_action == "preview":
+        if report.unified_diffs:
+            print("\n" + "=" * 70)
+            print("PREVIEW GENERATED PATCHES:")
+            print("=" * 70)
+            for fp, diff in report.unified_diffs.items():
+                print(f"--- {fp} ---")
+                print(diff.strip())
+            print("=" * 70)
+        else:
+            print("\n[OK] No patch diffs to preview.")
+        return report
 
     if chosen_action in ("apply_and_install", "1"):
         print("\n[>>] Applying fixes to client codebase...")

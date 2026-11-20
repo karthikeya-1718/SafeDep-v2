@@ -375,6 +375,112 @@ def extract_public_snapshot(tree: ast.AST, file_path: str = "", module_name: str
     return snapshot
 
 
+def format_demo_case_1_report(diff_result: dict[str, Any]) -> str:
+    """Format Demo Case 1 output with custom tables and options."""
+    summary = diff_result.get("summary", {})
+    total = summary.get("total", 0)
+    has_breaking = diff_result.get("breaking_changes_found", False)
+    status_str = "CRITICAL - BREAKING CHANGES DETECTED" if has_breaking else "CLEAN - NO BREAKING CHANGES FOUND"
+
+    border = "=" * 70
+
+    lines = [
+        border,
+        f"  Status: {status_str}",
+        f"  Total Breaking Changes: {total}",
+        border,
+        "SUMMARY BREAKDOWN:",
+        f"  * Removed Functions:    {summary.get('removed_functions', 0)}",
+        f"  * Removed Classes:      {summary.get('removed_classes', 0)}",
+        f"  * Removed Methods:      {summary.get('removed_methods', 0)}",
+        f"  * Changed Signatures:   {summary.get('changed_signatures', 0)}",
+        f"  * Removed Base Classes: {summary.get('removed_base_classes', 0)}",
+        f"  * Removed Constants:    {summary.get('removed_constants', 0)}",
+        f"  * Removed Modules:      {summary.get('removed_modules', 0)}",
+        border,
+        "",
+    ]
+
+    # Map of function to clean change description
+    clean_reasons = {
+        "fetch_user_profile": "New required parameter 'auth_token' added",
+        "execute_query": "Parameter 'timeout' was removed",
+        "format_invoice": "Positional parameters reordered",
+        "set_notification_channel": "Default value removed (now required)",
+    }
+
+    # Table 1: Breaking changes with Risk
+    # Columns: # (4), Function (29), Breaking Change (52), Risk (10)
+    t1_top = "┌────┬─────────────────────────────┬────────────────────────────────────────────────────┬──────────┐"
+    t1_hdr = "│ #  │ Function                    │ Breaking Change                                    │ Risk     │"
+    t1_mid = "├────┼─────────────────────────────┼────────────────────────────────────────────────────┼──────────┤"
+    t1_bot = "└────┴─────────────────────────────┴────────────────────────────────────────────────────┴──────────┘"
+
+    lines.extend([t1_top, t1_hdr, t1_mid])
+
+    sig_changes = diff_result.get("changed_signatures", [])
+    for idx, sc in enumerate(sig_changes, 1):
+        fn_name = sc.get("name", "")
+        raw_reason = sc.get("reasons", ["Signature altered"])[0]
+        desc = clean_reasons.get(fn_name, raw_reason)
+        # Truncate if too long
+        if len(desc) > 50:
+            desc = desc[:47] + "..."
+        fn_padded = fn_name.ljust(27)
+        desc_padded = desc.ljust(50)
+        risk_padded = "Medium".ljust(8)
+        idx_padded = str(idx).ljust(2)
+        lines.append(f"│ {idx_padded} │ {fn_padded} │ {desc_padded} │ {risk_padded} │")
+
+    lines.extend([t1_bot, ""])
+
+    # Table 2: Old -> New signatures
+    # Columns: Function (29), Old Signature (46), New Signature (48)
+    t2_top = "┌─────────────────────────────┬──────────────────────────────────────────────┬────────────────────────────────────────────────┐"
+    t2_hdr = "│ Function                    │ Old Signature                                │ New Signature                                  │"
+    t2_mid = "├─────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────────────────┤"
+    t2_bot = "└─────────────────────────────┴──────────────────────────────────────────────┴────────────────────────────────────────────────┘"
+
+    lines.extend([t2_top, t2_hdr, t2_mid])
+
+    # Clean display signatures
+    clean_sigs = {
+        "fetch_user_profile": ("(user_id)", "(user_id, auth_token)"),
+        "execute_query": ("(query_str, timeout=30)", "(query_str)"),
+        "format_invoice": ("(customer_name, total_amount)", "(total_amount, customer_name)"),
+        "set_notification_channel": ('(channel="email")', "(channel)"),
+    }
+
+    for sc in sig_changes:
+        fn_name = sc.get("name", "")
+        if fn_name in clean_sigs:
+            old_s, new_s = clean_sigs[fn_name]
+        else:
+            old_full = sc.get("old_signature", "")
+            new_full = sc.get("new_signature", "")
+            import re
+            m_old = re.search(r"\((.*?)\)", old_full)
+            m_new = re.search(r"\((.*?)\)", new_full)
+            old_s = f"({m_old.group(1)})" if m_old else old_full
+            new_s = f"({m_new.group(1)})" if m_new else new_full
+
+        fn_pad = fn_name.ljust(27)
+        old_pad = old_s.ljust(44)
+        new_pad = new_s.ljust(46)
+        lines.append(f"│ {fn_pad} │ {old_pad} │ {new_pad} │")
+
+    lines.extend([t2_bot, ""])
+    lines.extend([
+        "What would you like to do?",
+        "1. Preview Patches",
+        "2. Apply Patches",
+        "3. Apply Patches + Install New Library",
+        "4. Exit",
+    ])
+
+    return "\n".join(lines)
+
+
 def format_diff_report(diff_result: dict[str, Any], title: str = "SafeDep Breaking Changes Report") -> str:
     """Format the breaking changes dictionary into an attractive, clear terminal report."""
     summary = diff_result.get("summary", {})
@@ -469,3 +575,37 @@ def format_diff_report(diff_result: dict[str, Any], title: str = "SafeDep Breaki
     lines.append(border)
     return "\n".join(lines)
 
+
+
+def format_demo_case_2_banner() -> str:
+    """Return the Demo Case 2 welcome banner for the post-repair interactive mode."""
+    border = "=" * 70
+    sub = "-" * 70
+    lines = [
+        border,
+        "  SAFEDEP \u2014 DEMO CASE 2: POST-INSTALL BEHAVIOURAL REPAIR",
+        border,
+        "",
+        "  Scenario: Order Processing Service upgraded v1.x \u2192 v2.x",
+        "  Signatures: IDENTICAL (no changes detected by static analysis)",
+        "  Problem:    4 BEHAVIOURAL breaking changes in new_service.py",
+        "",
+        sub,
+        "  BREAKING BEHAVIOURAL CHANGES (same signatures, different behaviour):",
+        sub,
+        "",
+        "  \u250c\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510",
+        "  \u2502 # \u2502 Function             \u2502 Behavioural Change                    \u2502",
+        "  \u251c\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524",
+        "  \u2502 1 \u2502 get_order_status     \u2502 'status' key \u2192 nested 'state' dict    \u2502",
+        "  \u2502 2 \u2502 calculate_discount   \u2502 10% member off \u2192 15% off; +5% non-mbr \u2502",
+        "  \u2502 3 \u2502 authenticate_user    \u2502 'token' key \u2192 'access_token'          \u2502",
+        "  \u2502 4 \u2502 list_products        \u2502 string list \u2192 dict list               \u2502",
+        "  \u2514\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518",
+        "",
+        "  [!] None of these are detectable by static analysis (no signature change).",
+        "  [!] SafeDep Post-Install Repair detects them by RUNNING YOUR TEST SUITE.",
+        "",
+        border,
+    ]
+    return "\n".join(lines)

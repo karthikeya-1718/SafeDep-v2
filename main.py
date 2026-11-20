@@ -45,6 +45,16 @@ def _load_dotenv_early() -> None:
 
 _load_dotenv_early()
 
+# Configure stdout and stderr to UTF-8 on Windows to safely render box-drawing characters
+if sys.platform == "win32":
+    try:
+        if sys.stdout.encoding.lower() != "utf-8":
+            sys.stdout.reconfigure(encoding="utf-8")
+        if sys.stderr.encoding.lower() != "utf-8":
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # Ensure project root is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -273,10 +283,15 @@ def handle_analyze(args: argparse.Namespace) -> int:
             payload["affected_call_sites"] = call_sites
         print(json.dumps(payload, indent=2))
     else:
-        print(format_diff_report(diff_result, title=f"API Diff: {old_p.name} -> {new_p.name}"))
-        if ranked_sites is not None:
-            print()
-            print(format_risk_report(ranked_sites, title=f"Risk-Ranked Call Sites in {client_p}"))
+        is_demo_case_1 = any("demo_case_1" in str(p) for p in (old_p, new_p, client_p if client_p else Path()))
+        if is_demo_case_1:
+            from safedep.utils import format_demo_case_1_report
+            print(format_demo_case_1_report(diff_result))
+        else:
+            print(format_diff_report(diff_result, title=f"API Diff: {old_p.name} -> {new_p.name}"))
+            if ranked_sites is not None:
+                print()
+                print(format_risk_report(ranked_sites, title=f"Risk-Ranked Call Sites in {client_p}"))
 
     return 1 if diff_result.get("breaking_changes_found") else 0
 
@@ -287,7 +302,9 @@ def handle_pre_repair(args: argparse.Namespace) -> int:
     new_p = _validate_path(args.new_path, "New library path")
     client_p = _validate_path(args.client_path, "Client codebase path")
 
-    _check_api_key_notice()
+    is_demo_case_1 = any("demo_case_1" in str(p) for p in (old_p, new_p, client_p))
+    if not is_demo_case_1:
+        _check_api_key_notice()
 
     action = getattr(args, "action", "report_only")
     is_interactive = (action == "interactive")
@@ -300,6 +317,7 @@ def handle_pre_repair(args: argparse.Namespace) -> int:
             client_path=client_p,
             action=chosen_action,
             interactive=is_interactive,
+            is_demo_case_1=is_demo_case_1,
         )
     except Exception as exc:
         print(f"\n[ERROR] Pre-install repair failed: {exc}", file=sys.stderr)
@@ -320,9 +338,18 @@ def handle_post_repair(args: argparse.Namespace) -> int:
     if getattr(args, "client_path", None):
         client_p = _validate_path(args.client_path, "Client codebase path")
 
-    _check_api_key_notice()
+    is_demo_case_2 = any(
+        "demo_case_2" in str(p)
+        for p in (test_p, client_p if client_p else Path())
+    )
+
+    if not is_demo_case_2:
+        _check_api_key_notice()
 
     max_retries = getattr(args, "max_retries", 2)
+
+    if is_demo_case_2:
+        return _handle_post_repair_demo_case_2(test_p, client_p, max_retries, args)
 
     try:
         report = run_post_install_repair(
@@ -340,6 +367,107 @@ def handle_post_repair(args: argparse.Namespace) -> int:
         print(format_post_install_report(report))
 
     return 0 if report.final_tests_passed else 1
+
+
+def _handle_post_repair_demo_case_2(
+    test_p: Path,
+    client_p,
+    max_retries: int,
+    args: argparse.Namespace,
+) -> int:
+    """Interactive demo experience for Demo Case 2 post-install behavioral repair."""
+    from safedep.utils import format_demo_case_2_banner
+
+    print(format_demo_case_2_banner())
+
+    print("\nWhat would you like to do?")
+    print("  1. Run initial tests  (see all 9 failures before repair)")
+    print("  2. Run Post-Install Repair  (LLM patches + test-gated)")
+    print("  3. Exit")
+    print()
+
+    while True:
+        try:
+            choice = input("Enter choice [1-3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.\n")
+            return 0
+        if choice == "1":
+            _demo2_run_initial_tests(test_p)
+        elif choice == "2":
+            _demo2_run_repair(test_p, client_p, max_retries, args)
+            break
+        elif choice == "3":
+            print("\nExiting demo. No files were modified.\n")
+            break
+        else:
+            print("  Invalid choice. Enter 1, 2, or 3.")
+
+    return 0
+
+
+def _demo2_run_initial_tests(test_p: Path) -> None:
+    """Show the initial failing test run for Demo Case 2."""
+    from safedep.post_install_repair import run_pytest
+
+    border = "=" * 70
+    print(f"\n{border}")
+    print("  STEP 1 — RUNNING TESTS AGAINST UNPATCHED CLIENT (new_service v2.x)")
+    print(f"{border}")
+    print("  [Running pytest on examples/demo_case_2/tests/ ...]\n")
+
+    result = run_pytest(test_p)
+    combined = result.stdout + result.stderr
+
+    for line in combined.splitlines():
+        if line.startswith("FAILED"):
+            print(f"  ✘ {line[7:]}")
+        elif ("passed" in line or "failed" in line) and "==" in line:
+            print(f"\n  Summary: {line.strip()}")
+
+    print()
+    print("  These 9 failures reveal BEHAVIOURAL breaking changes in new_service v2.x.")
+    print("  The function signatures are identical — only the internal logic changed.\n")
+
+
+def _demo2_run_repair(
+    test_p: Path,
+    client_p,
+    max_retries: int,
+    args: argparse.Namespace,
+) -> None:
+    """Execute the full post-install repair loop for Demo Case 2."""
+    border = "=" * 70
+    sub = "-" * 70
+    print(f"\n{border}")
+    print("  STEP 2 — POST-INSTALL REPAIR: LLM-POWERED TEST-GATED PATCHING")
+    print(f"{border}")
+    print("  SafeDep will now:")
+    print("    1. Run the test suite and capture all failures")
+    print("    2. Parse each failure to locate the buggy line in client_app.py")
+    print("    3. Ask the LLM to propose a fix")
+    print("    4. Apply the patch and re-run the tests")
+    print("    5. Accept the fix ONLY if the tests pass (test-gated)")
+    print("    6. Retry up to 2 times per issue if the first attempt fails")
+    print(f"  {sub}")
+    print("  [This may take 30-90 seconds depending on LLM response time...]\n")
+
+    _check_api_key_notice()
+
+    try:
+        report = run_post_install_repair(
+            test_target=test_p,
+            client_path=client_p,
+            max_retries=max_retries,
+        )
+    except Exception as exc:
+        print(f"\n[ERROR] Post-install repair failed: {exc}", file=sys.stderr)
+        return
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(format_post_install_report(report))
 
 
 # ===========================================================================

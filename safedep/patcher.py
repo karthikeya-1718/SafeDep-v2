@@ -238,11 +238,11 @@ _SYSTEM_PROMPT = (
     "You are SafeDep's automated Python code refactoring engine.\n"
     "Your sole task is to rewrite a single broken Python call expression or statement to make it compatible with an updated library API.\n"
     "CRITICAL CONSTRAINTS:\n"
-    "1. Return ONLY the single replacement Python expression or statement.\n"
+    "1. Return ONLY the replacement call expression itself (e.g. `func(...)`). Do NOT include variable assignments like `x = func(...)` unless the original expression was already an assignment statement.\n"
     "2. Do NOT output markdown formatting, backticks, explanations, comments, or quotes.\n"
     "3. Keep all unchanged arguments and expressions exactly as they were.\n"
     "4. If an existing argument/parameter was renamed or changed to keyword-only, update the keyword name (e.g. from priority=1 to level=1) and preserve its passed value.\n"
-    "5. Ensure the output is valid Python code that can directly replace the original call."
+    "5. Ensure the output is valid Python code that can directly replace the original call expression."
 )
 
 
@@ -286,6 +286,19 @@ def _clean_model_response(raw_text: str) -> str:
         inner = cleaned[1:-1].strip()
         if "(" in inner and ")" in inner:
             cleaned = inner
+
+    # If the model added a variable assignment (e.g. `x = func(...)`) but the original
+    # call snippet was only `func(...)` (no `=` at top-level outside quotes/parens):
+    if "=" in cleaned and not cleaned.startswith("def "):
+        try:
+            tree = ast.parse(cleaned)
+            if len(tree.body) == 1 and isinstance(tree.body[0], ast.Assign):
+                # Extract right-hand side expression if assignment was generated
+                rhs = ast.unparse(tree.body[0].value)
+                return rhs
+        except Exception:
+            pass
+
     return cleaned
 
 
