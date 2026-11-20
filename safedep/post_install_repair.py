@@ -159,6 +159,9 @@ def run_pytest(
     if env:
         exec_env.update(env)
 
+    # Avoid writing/loading stale bytecode between rapid source rewrites
+    exec_env["PYTHONDONTWRITEBYTECODE"] = "1"
+
     # Make sure target parent and work_dir are in PYTHONPATH
     search_dirs = [str(work_dir.resolve())]
     if target_p.is_file():
@@ -493,6 +496,29 @@ def _resolve_and_map_issue(
     return issue
 
 
+
+def _invalidate_bytecode_cache(file_path: Union[str, Path]) -> None:
+    """Remove stale .pyc / __pycache__ entries for *file_path*."""
+    p = Path(file_path).resolve()
+    if not p.suffix == ".py":
+        return
+    adjacent = p.with_suffix(".pyc")
+    if adjacent.exists():
+        try:
+            adjacent.unlink()
+        except OSError:
+            pass
+    cache_dir = p.parent / "__pycache__"
+    if cache_dir.is_dir():
+        stem = p.stem
+        for entry in cache_dir.iterdir():
+            if entry.name.startswith(stem + ".") and entry.suffix == ".pyc":
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+
+
 def apply_line_patch(
     file_path: Union[str, Path],
     line_number: int,
@@ -540,6 +566,7 @@ def apply_line_patch(
 
     modified = "".join(lines)
     p.write_text(modified, encoding="utf-8")
+    _invalidate_bytecode_cache(p)
     return True, original, modified
 
 
@@ -710,6 +737,7 @@ def run_post_install_repair(
             else:
                 # REVERT! Test failed, reject candidate patch
                 target_path.write_text(current_content, encoding="utf-8")
+                _invalidate_bytecode_cache(target_path)
                 issue.error_output = (verify_res.stdout + "\n" + verify_res.stderr)[:300]
 
         if not issue_resolved:
