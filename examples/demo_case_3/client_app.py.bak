@@ -1,0 +1,18 @@
+"""Client application for checkout processing."""
+
+from new_library import calculate_total
+
+
+def compute_final_bill(subtotal: float, discount: float = 0.0) -> float:
+    """Compute the final charge amount for a customer.
+
+    In v1.0, calculate_total was tax-inclusive, so calling it directly
+    returned the grand total (e.g., $100 -> $110.00).
+    In v2.0, calculate_total is tax-exclusive, returning $100.00.
+    """
+    return calculate_total(subtotal, discount)
+
+
+if __name__ == "__main__":
+    bill = compute_final_bill(100.0, 0.0)
+    print("Final customer charge:", bill)

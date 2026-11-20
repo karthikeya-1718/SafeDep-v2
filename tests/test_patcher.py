@@ -136,7 +136,7 @@ class TestProposePatch(unittest.TestCase):
         """propose_patch correctly bundles code_context into the DeepSeek payload."""
         captured: dict = {}
 
-        def fake_deepseek(call_expression, breaking_change, old_signature, new_signature, code_context, api_key, model):
+        def fake_deepseek(call_expression, breaking_change, old_signature, new_signature, code_context, api_key, model, **kwargs):
             captured["code_context"] = code_context
             return call_expression  # echo unchanged
 

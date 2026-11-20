@@ -136,19 +136,20 @@ def run_pytest(
         TestSuiteResult with execution status, returncode, and captured output.
     """
     target_str = str(test_target)
-    target_p = Path(target_str)
+    target_p = Path(target_str).resolve()
 
-    # Determine safe working dir and rootdir to avoid directory traversal
-    work_dir = Path(cwd) if cwd else (target_p.parent if target_p.is_file() else target_p)
+    # Determine safe working dir:
+    # If cwd is explicitly given, use it; otherwise use directory containing the tests
+    # (or test file's parent directory), so pytest runs within the project / test context.
+    work_dir = Path(cwd).resolve() if cwd else (target_p.parent if target_p.is_file() else target_p)
 
     cmd = [
         sys.executable,
         "-m",
         "pytest",
-        f"--rootdir={work_dir}",
         "-p",
         "no:cacheprovider",
-        target_str,
+        str(target_p),
         "-v",
         "--tb=short",
     ]
@@ -454,15 +455,39 @@ def _resolve_and_map_issue(
                     client_candidates.extend(cand.resolve().glob("**/*.py"))
 
         is_test_file = "test" in target_p.name.lower() or "tests" in target_p.parts
-        if is_test_file and issue.call_expression:
+        if is_test_file:
             try:
-                tree = ast.parse(issue.call_expression)
                 called_names: list[str] = []
-                for n in ast.walk(tree):
-                    if isinstance(n, ast.Call):
-                        name = getattr(n.func, "id", getattr(n.func, "attr", None))
-                        if name:
-                            called_names.append(name)
+                # First try extracting calls directly from the failing assertion/line
+                if issue.call_expression:
+                    try:
+                        tree = ast.parse(issue.call_expression)
+                        for n in ast.walk(tree):
+                            if isinstance(n, ast.Call):
+                                name = getattr(n.func, "id", getattr(n.func, "attr", None))
+                                if name:
+                                    called_names.append(name)
+                    except Exception:
+                        pass
+
+                # If no call in the assert expression itself (e.g. `assert total == 110.0`),
+                # inspect the enclosing test function in the test file to identify client calls
+                if not called_names and target_p.is_file():
+                    try:
+                        t_tree = ast.parse(target_p.read_text(encoding="utf-8"))
+                        for t_node in ast.walk(t_tree):
+                            if isinstance(t_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                if t_node.name == issue.test_name or (
+                                    t_node.lineno <= issue.line_number <= getattr(t_node, "end_lineno", issue.line_number)
+                                ):
+                                    for t_stmt in t_node.body:
+                                        for t_n in ast.walk(t_stmt):
+                                            if isinstance(t_n, ast.Call):
+                                                c_name = getattr(t_n.func, "id", getattr(t_n.func, "attr", None))
+                                                if c_name and c_name not in called_names:
+                                                    called_names.append(c_name)
+                    except Exception:
+                        pass
 
                 for cfile in client_candidates:
                     if not cfile.is_file():
@@ -634,6 +659,17 @@ def run_post_install_repair(
     for raw_iss in raw_issues:
         issues.append(_resolve_and_map_issue(raw_iss, client_path=client_path, search_dirs=search_dirs))
 
+    # Deduplicate: if multiple tests fail on the same client line, treat as one repair target.
+    # The first issue (usually the more descriptive one) is kept; duplicates are dropped.
+    seen_locations: set[tuple[str, int]] = set()
+    deduped_issues: list[PostInstallIssue] = []
+    for issue in issues:
+        key = (issue.file_path, issue.line_number)
+        if key not in seen_locations:
+            seen_locations.add(key)
+            deduped_issues.append(issue)
+    issues = deduped_issues
+
     fixed_issues: list[PostInstallIssue] = []
     failed_issues: list[PostInstallIssue] = []
     patched_files: dict[str, str] = {}
@@ -665,7 +701,12 @@ def run_post_install_repair(
 
             # Generate fix via shared propose_patch
             breaking_info: dict[str, Any] = {
-                "breaking_change": f"Behavioral failure: {issue.error_type}: {issue.error_message}",
+                "breaking_change": (
+                    f"Runtime behavioral mismatch — the library's internal logic changed. "
+                    f"Test '{issue.test_name}' fails with: {issue.error_type}: {issue.error_message}. "
+                    f"The client code at the patched line must be adapted to produce the expected result. "
+                    f"Rewrite only the expression on the given line to compensate for the new library behavior."
+                ),
                 "error_type": issue.error_type,
                 "error_message": issue.error_message,
                 "code_context": issue.code_context,

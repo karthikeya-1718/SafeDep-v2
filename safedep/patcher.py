@@ -169,6 +169,12 @@ def propose_patch(
             * ``"code_context"``    – surrounding source lines for richer AI
               prompts.
             * ``"suggested_fix"``   – optional explicit replacement for fallback.
+            * ``"error_type"``      – error class (e.g. ``"AssertionError"``);
+              presence signals a **behavioral** (not signature) repair.
+            * ``"error_message"``   – full error message from the failing test.
+            * ``"test_name"``       – name of the failing test.
+            * ``"attempt"``         – current attempt number (1-based).
+            * ``"feedback"``        – failure reason from previous attempt.
 
         api_key: Explicit API key override.
         model: Model name. Defaults to ``"deepseek-chat"`` (automatically maps to
@@ -188,6 +194,15 @@ def propose_patch(
     old_signature = breaking_change_info.get("old_signature")
     new_signature = breaking_change_info.get("new_signature")
     code_context = str(breaking_change_info.get("code_context", ""))
+
+    # Detect behavioral vs. signature repair mode
+    # Behavioral: triggered when "error_type" key is present (set by post_install_repair)
+    is_behavioral = bool(breaking_change_info.get("error_type"))
+    error_type = str(breaking_change_info.get("error_type", "AssertionError"))
+    error_message = str(breaking_change_info.get("error_message", ""))
+    test_name = str(breaking_change_info.get("test_name", ""))
+    attempt = int(breaking_change_info.get("attempt", 1))
+    feedback = str(breaking_change_info.get("feedback", ""))
 
     # Explicit empty string forces AST engine (used by shims)
     if api_key == "":
@@ -215,6 +230,12 @@ def propose_patch(
             code_context=code_context,
             api_key=resolved_key,
             model=groq_model,
+            is_behavioral=is_behavioral,
+            error_type=error_type,
+            error_message=error_message,
+            test_name=test_name,
+            attempt=attempt,
+            feedback=feedback,
         )
 
     # 2. Otherwise default to DeepSeek path (checks key or falls back to AST)
@@ -227,6 +248,12 @@ def propose_patch(
         code_context=code_context,
         api_key=resolved_key,
         model=ds_model,
+        is_behavioral=is_behavioral,
+        error_type=error_type,
+        error_message=error_message,
+        test_name=test_name,
+        attempt=attempt,
+        feedback=feedback,
     )
 
 
@@ -243,6 +270,18 @@ _SYSTEM_PROMPT = (
     "3. Keep all unchanged arguments and expressions exactly as they were.\n"
     "4. If an existing argument/parameter was renamed or changed to keyword-only, update the keyword name (e.g. from priority=1 to level=1) and preserve its passed value.\n"
     "5. Ensure the output is valid Python code that can directly replace the original call expression."
+)
+
+_BEHAVIORAL_SYSTEM_PROMPT = (
+    "You are SafeDep's automated Python code repair engine specializing in BEHAVIORAL breaking changes.\n"
+    "A library's internal logic changed (same API signature, different return value or behavior).\n"
+    "Your task is to rewrite the client code line so that the client produces the EXPECTED result despite the library change.\n"
+    "CRITICAL CONSTRAINTS:\n"
+    "1. Return ONLY the single fixed Python statement or expression — no imports, no extra lines.\n"
+    "2. Do NOT output markdown formatting, backticks, explanations, comments, or quotes.\n"
+    "3. The fix must compensate for the behavioral change in the library (e.g., wrap the call, adjust the result arithmetically).\n"
+    "4. Ensure the output is valid Python that directly replaces the original line.\n"
+    "5. Use round(..., 2) when dealing with floating-point arithmetic to avoid precision issues."
 )
 
 
@@ -270,6 +309,54 @@ def _build_refactor_prompt(
         "Return ONLY the single fixed Python call expression or statement. Nothing else."
     )
     return "\n".join(parts)
+
+
+def _build_behavioral_repair_prompt(
+    call_expression: str,
+    error_message: str,
+    error_type: str = "AssertionError",
+    code_context: str = "",
+    test_name: str = "",
+    attempt: int = 1,
+    feedback: str = "",
+) -> str:
+    """Construct a behavioral-repair prompt for assertion/value-mismatch failures.
+
+    Used when the library signature is unchanged but its internal logic changed,
+    causing client tests to fail on unexpected return values.
+    """
+    parts = [
+        "BEHAVIORAL BREAKING CHANGE REPAIR",
+        "",
+        "The library's internal behavior changed (same function signature, different output).",
+        "The client code must be adapted to compensate so that tests pass.",
+        "",
+        f"Failing test: {test_name}" if test_name else "",
+        f"Failure: {error_type}: {error_message}",
+        "",
+        "Client code line to fix:",
+        f"  {call_expression}",
+        "",
+    ]
+    if code_context:
+        parts.append("Surrounding context:")
+        parts.append(code_context)
+        parts.append("")
+
+    if attempt > 1 and feedback:
+        parts.append(f"Previous attempt #{attempt - 1} failed: {feedback}")
+        parts.append("Adjust the fix accordingly.")
+        parts.append("")
+
+    parts.append(
+        "Instruction: Rewrite ONLY the given client code line so it produces the value "
+        "expected by the failing test. For example, if the library now returns a tax-exclusive "
+        "total but the test expects a tax-inclusive total, multiply the result by the tax factor. "
+        "Return ONLY the single fixed Python statement or expression. "
+        "Do NOT add imports, comments, or change any other lines. Nothing else."
+    )
+    # Strip empty strings at start
+    return "\n".join(p for p in parts if p is not None)
 
 
 def _clean_model_response(raw_text: str) -> str:
@@ -414,6 +501,12 @@ def _patch_with_groq(
     code_context: str = "",
     api_key: Optional[str] = None,
     model: str = "llama-3.3-70b-versatile",
+    is_behavioral: bool = False,
+    error_type: str = "AssertionError",
+    error_message: str = "",
+    test_name: str = "",
+    attempt: int = 1,
+    feedback: str = "",
 ) -> str:
     """Request a refactoring patch using Groq's API.
     
@@ -422,13 +515,26 @@ def _patch_with_groq(
     """
     effective_key = api_key or os.environ.get("GROQ_API_KEY")
     if effective_key:
-        prompt = _build_refactor_prompt(
-            call_expression=call_expression,
-            breaking_change=breaking_change,
-            old_signature=old_signature,
-            new_signature=new_signature,
-            code_context=code_context,
-        )
+        if is_behavioral:
+            prompt = _build_behavioral_repair_prompt(
+                call_expression=call_expression,
+                error_message=error_message,
+                error_type=error_type,
+                code_context=code_context,
+                test_name=test_name,
+                attempt=attempt,
+                feedback=feedback,
+            )
+            system_prompt = _BEHAVIORAL_SYSTEM_PROMPT
+        else:
+            prompt = _build_refactor_prompt(
+                call_expression=call_expression,
+                breaking_change=breaking_change,
+                old_signature=old_signature,
+                new_signature=new_signature,
+                code_context=code_context,
+            )
+            system_prompt = _SYSTEM_PROMPT
         
         # 1. Prefer official `groq` Python package if available
         # (Skipped if urllib is specifically mocked during testing)
@@ -436,6 +542,7 @@ def _patch_with_groq(
             api_key=effective_key,
             model=model,
             prompt=prompt,
+            system_prompt=system_prompt,
         )
         if sdk_res:
             return sdk_res
@@ -446,6 +553,7 @@ def _patch_with_groq(
             api_key=effective_key,
             model=model,
             prompt=prompt,
+            system_prompt=system_prompt,
         )
         if result:
             return result
@@ -467,22 +575,42 @@ def _patch_with_deepseek(
     code_context: str = "",
     api_key: Optional[str] = None,
     model: str = "deepseek-chat",
+    is_behavioral: bool = False,
+    error_type: str = "AssertionError",
+    error_message: str = "",
+    test_name: str = "",
+    attempt: int = 1,
+    feedback: str = "",
 ) -> str:
     """Request a refactoring patch using DeepSeek API."""
     effective_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
     if effective_key:
-        prompt = _build_refactor_prompt(
-            call_expression=call_expression,
-            breaking_change=breaking_change,
-            old_signature=old_signature,
-            new_signature=new_signature,
-            code_context=code_context,
-        )
+        if is_behavioral:
+            prompt = _build_behavioral_repair_prompt(
+                call_expression=call_expression,
+                error_message=error_message,
+                error_type=error_type,
+                code_context=code_context,
+                test_name=test_name,
+                attempt=attempt,
+                feedback=feedback,
+            )
+            system_prompt = _BEHAVIORAL_SYSTEM_PROMPT
+        else:
+            prompt = _build_refactor_prompt(
+                call_expression=call_expression,
+                breaking_change=breaking_change,
+                old_signature=old_signature,
+                new_signature=new_signature,
+                code_context=code_context,
+            )
+            system_prompt = _SYSTEM_PROMPT
         result = _execute_chat_completion(
             endpoint=PROVIDERS["deepseek"].endpoint,
             api_key=effective_key,
             model=model,
             prompt=prompt,
+            system_prompt=system_prompt,
         )
         if result:
             return result

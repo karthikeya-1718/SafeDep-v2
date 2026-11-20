@@ -230,6 +230,97 @@ def test_status():
             self.assertEqual(client_file.read_text(encoding="utf-8"), original_code)
             self.assertEqual(report.failed_issues[0].attempt_count, 2)
 
+    def test_deduplication_same_line_patched_once(self):
+        """Test that multiple tests failing on the same client line are deduplicated.
+
+        When 2 failing tests both map to the same (file, line), propose_patch
+        is called at most max_retries times total — not max_retries × 2.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            dir_path = Path(td)
+            client_file = self._write_file(
+                dir_path,
+                "billing.py",
+                """
+def compute_total(amount: float) -> float:
+    return amount * 1.0
+""",
+            )
+            test_file = self._write_file(
+                dir_path,
+                "test_billing.py",
+                f"""
+import sys
+sys.path.insert(0, r"{td}")
+from billing import compute_total
+
+def test_total_basic():
+    assert compute_total(100.0) == 110.0
+
+def test_total_extended():
+    assert compute_total(200.0) == 220.0
+""",
+            )
+
+            patch_call_count = {"n": 0}
+
+            def counting_patch(code_snippet, breaking_change_info, **kwargs):
+                patch_call_count["n"] += 1
+                # Always return an unchanged snippet → triggers revert every time
+                return code_snippet
+
+            with patch("safedep.post_install_repair.propose_patch", side_effect=counting_patch):
+                report = run_post_install_repair(
+                    test_target=test_file,
+                    client_path=client_file,
+                    max_retries=2,
+                    cwd=dir_path,
+                )
+
+            # 2 tests fail, BUT they map to at most 1 unique (file, line) after dedup.
+            # With max_retries=2, propose_patch should be called AT MOST 2 times
+            # (1 deduplicated issue × 2 retries), not 4 (2 issues × 2 retries).
+            self.assertLessEqual(
+                patch_call_count["n"], 2,
+                msg=f"Expected at most 2 propose_patch calls after deduplication, got {patch_call_count['n']}"
+            )
+            # Issues detected should be 1 (deduplicated) or possibly 2 if mapping differs per test
+            self.assertGreaterEqual(report.total_issues_detected, 1)
+
+    def test_behavioral_prompt_used_when_error_type_present(self):
+        """Test that _build_behavioral_repair_prompt is invoked for behavioral failures."""
+        from safedep import patcher
+
+        called_with = {}
+
+        original_build = patcher._build_behavioral_repair_prompt
+
+        def spy_behavioral_prompt(call_expression, error_message, **kwargs):
+            called_with["called"] = True
+            called_with["call_expression"] = call_expression
+            called_with["error_message"] = error_message
+            return original_build(call_expression, error_message, **kwargs)
+
+        with patch.object(patcher, "_build_behavioral_repair_prompt", side_effect=spy_behavioral_prompt):
+            with patch.object(patcher, "_call_groq_sdk", return_value=None):
+                with patch.object(patcher, "_execute_chat_completion", return_value="return amount * 1.10"):
+                    with patch.dict("os.environ", {"GROQ_API_KEY": "gsk_test_key_placeholder"}):
+                        result = patcher.propose_patch(
+                            code_snippet="return amount * 1.0",
+                            breaking_change_info={
+                                "breaking_change": "Behavioral failure: AssertionError: assert 100.0 == 110.0",
+                                "error_type": "AssertionError",
+                                "error_message": "assert 100.0 == 110.0",
+                                "test_name": "test_total_basic",
+                                "attempt": 1,
+                                "feedback": "",
+                            },
+                        )
+
+        self.assertTrue(called_with.get("called"), "Expected _build_behavioral_repair_prompt to be called")
+        self.assertEqual(called_with.get("call_expression"), "return amount * 1.0")
+        self.assertIn("110.0", called_with.get("error_message", ""))
+
     def test_format_post_install_report_content(self):
         """Test report formatting contains all required sections and notes."""
         report = PostInstallRepairReport(
