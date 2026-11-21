@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="max-w-3xl mx-auto space-y-6">
+  <h1 class="text-2xl font-bold">Shopping Cart</h1>
+
+  {% if items %}
+  <div class="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+    <div class="divide-y divide-slate-100">
+      {% for item in items %}
+      <div class="p-4 flex items-center justify-between">
+        <div class="flex items-center space-x-4">
+          <span class="text-3xl">{{ item.emoji }}</span>
+          <div>
+            <h4 class="font-bold">{{ item.name }}</h4>
+            <p class="text-xs text-slate-500">Qty: {{ item.qty }} &times; {{ CURRENCY }}{{ "%.2f"|format(item.price) }}</p>
+          </div>
+        </div>
+        <span class="font-bold text-slate-700">{{ CURRENCY }}{{ "%.2f"|format(item.price * item.qty) }}</span>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="p-4 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row justify-between items-center gap-4">
+      <form action="/cart/promo" method="POST" class="flex w-full sm:w-auto">
+        <input type="text" name="promo_code" value="{{ promo_code }}" placeholder="Promo code (e.g. SAVE10)" class="border border-slate-300 rounded-l-md px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+        <button type="submit" class="bg-slate-700 text-white px-4 py-1.5 rounded-r-md text-sm font-semibold hover:bg-slate-800">Apply promo</button>
+      </form>
+      <div class="text-right">
+        <span class="text-sm text-slate-500 block">Total Payable:</span>
+        <span class="text-2xl font-extrabold text-indigo-600">{{ CURRENCY }}{{ total_str }}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="flex justify-end space-x-4">
+    <a href="/products" class="px-5 py-2 border border-slate-300 rounded-md font-semibold text-slate-700 hover:bg-slate-50">Continue Shopping</a>
+    <a href="/checkout" class="px-6 py-2 bg-indigo-600 text-white rounded-md font-semibold hover:bg-indigo-700">Proceed to Checkout &rarr;</a>
+  </div>
+  {% else %}
+  <div class="bg-white rounded-xl border border-slate-200 p-12 text-center shadow-sm">
+    <p class="text-slate-500 text-lg">Your cart is empty.</p>
+    <a href="/products" class="mt-4 inline-block bg-indigo-600 text-white px-6 py-2 rounded-md font-semibold hover:bg-indigo-700">Browse Products</a>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

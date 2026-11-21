@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="max-w-2xl mx-auto bg-white rounded-xl border border-slate-200 p-8 shadow-sm">
+  <div class="text-7xl text-center py-6 bg-slate-50 rounded-lg mb-6">{{ product.emoji }}</div>
+  <h1 class="text-2xl font-bold">{{ product.name }}</h1>
+  <p class="text-2xl font-extrabold text-indigo-600 mt-2">{{ CURRENCY }}{{ "%.2f"|format(product.price) }}</p>
+  <p class="text-slate-600 mt-4 leading-relaxed">
+    Durable, high-grade outdoor gear built to withstand rugged conditions.
+  </p>
+  <div class="mt-8 pt-6 border-t border-slate-100 flex items-center justify-between">
+    <a href="/products" class="text-slate-500 hover:text-slate-800 text-sm font-medium">&larr; Back to catalog</a>
+    <form action="/cart/add" method="POST">
+      <input type="hidden" name="product_id" value="{{ product.id }}">
+      <input type="hidden" name="quantity" value="1">
+      <button type="submit" class="bg-indigo-600 text-white px-6 py-2 rounded-md font-semibold hover:bg-indigo-700">Add to cart</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
