@@ -29,11 +29,14 @@ wheels/
 # Virtual environments
 .env
 .venv
-env/
+.venv/
 venv/
+venv
+env/
 ENV/
 env.bak/
 venv.bak/
+test-v1/
 
 # Testing
 .pytest_cache/
