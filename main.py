@@ -246,6 +246,18 @@ def _check_api_key_notice() -> None:
 # Command Handlers
 # ===========================================================================
 
+# Keys injected by api_diff for internal call_compat use; must never reach JSON output.
+_INTERNAL_KEYS = frozenset({"old_fn", "new_fn"})
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively strip non-JSON-serializable internal keys from dicts/lists."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items() if k not in _INTERNAL_KEYS}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(item) for item in obj]
+    return obj
+
 
 def handle_analyze(args: argparse.Namespace) -> int:
     """Execute `safedep analyze`: Detect breaking changes & optional call graph ranking."""
@@ -284,11 +296,11 @@ def handle_analyze(args: argparse.Namespace) -> int:
             return 2
 
     if args.json:
-        payload: dict[str, Any] = {"diff": diff_result}
+        payload: dict[str, Any] = {"diff": _sanitize_for_json(diff_result)}
         if ranked_sites is not None:
-            payload["affected_call_sites"] = ranked_sites
+            payload["affected_call_sites"] = _sanitize_for_json(ranked_sites)
         elif call_sites is not None:
-            payload["affected_call_sites"] = call_sites
+            payload["affected_call_sites"] = _sanitize_for_json(call_sites)
         print(json.dumps(payload, indent=2))
     else:
         is_demo_case_1 = any("demo_case_1" in str(p) for p in (old_p, new_p, client_p if client_p else Path()))

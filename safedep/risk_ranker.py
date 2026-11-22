@@ -231,11 +231,16 @@ def rank_affected_call_sites(
 
     # Step 5: Sort
     if tier_ordering:
+        # Force CRITICAL for every startup-tier site regardless of score
+        for s in ranked_sites:
+            if s.get("when_fails") == "startup":
+                s["risk_level"] = "CRITICAL"
         ranked_sites.sort(
             key=lambda s: (
                 0 if s["when_fails"] == "startup" else 1,
-                -s["depth"],
+                -s["risk_score"],
                 -s.get("num_distinct_callers", 0),
+                -s["depth"],
                 str(s.get("file_path", "")),
                 int(s.get("line_number", 0)),
             )
