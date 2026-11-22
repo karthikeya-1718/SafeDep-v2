@@ -256,6 +256,14 @@ def handle_analyze(args: argparse.Namespace) -> int:
     if getattr(args, "client_path", None):
         client_p = _validate_path(args.client_path, "Client project path")
 
+    library_name: Optional[str] = None
+    try:
+        from safedep.environment import resolve_library_source
+        lib_src = resolve_library_source(new_p)
+        library_name = lib_src.name
+    except Exception:
+        library_name = None
+
     try:
         diff_result = get_breaking_changes(old_p, new_p)
     except SyntaxError as syn_err:
@@ -269,8 +277,8 @@ def handle_analyze(args: argparse.Namespace) -> int:
     call_sites: Optional[list[dict[str, Any]]] = None
     if client_p:
         try:
-            call_sites = get_affected_call_sites(client_p, diff_result)
-            ranked_sites = rank_affected_call_sites(call_sites, project_path=client_p)
+            call_sites = get_affected_call_sites(client_p, diff_result, library_name=library_name)
+            ranked_sites = rank_affected_call_sites(call_sites, project_path=client_p, library_name=library_name)
         except Exception as exc:
             print(f"\n[ERROR] Call graph analysis on client codebase failed: {exc}", file=sys.stderr)
             return 2
@@ -310,6 +318,14 @@ def handle_pre_repair(args: argparse.Namespace) -> int:
     is_interactive = (action == "interactive")
     chosen_action = None if is_interactive else action
 
+    library_name: Optional[str] = None
+    try:
+        from safedep.environment import resolve_library_source
+        lib_src = resolve_library_source(new_p)
+        library_name = lib_src.name
+    except Exception:
+        library_name = None
+
     try:
         report = run_pre_install_repair(
             old_path=old_p,
@@ -318,6 +334,7 @@ def handle_pre_repair(args: argparse.Namespace) -> int:
             action=chosen_action,
             interactive=is_interactive,
             is_demo_case_1=is_demo_case_1,
+            library_name=library_name,
         )
     except Exception as exc:
         print(f"\n[ERROR] Pre-install repair failed: {exc}", file=sys.stderr)

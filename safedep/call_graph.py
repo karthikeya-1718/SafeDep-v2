@@ -67,6 +67,16 @@ class CallSite:
     qualified_callee: str  # Full expression, e.g. 'client.disconnect' or 'api.calculate_tax'
     call_expression: str  # Unparsed call expression string
     breaking_change: Optional[str] = None  # The matching breaking change symbol
+    col_offset: int = 0
+    end_line: Optional[int] = None
+    end_col_offset: Optional[int] = None
+    positional_args_count: int = 0
+    keyword_args: list[str] = field(default_factory=list)
+    has_varargs: bool = False
+    has_varkwargs: bool = False
+    is_from_library: bool = True
+    compatibility: str = "breaks"
+    is_removal: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert call site to a dictionary with required fields."""
@@ -83,6 +93,17 @@ class CallSite:
             "line": self.line_number,
             "call_expression": self.call_expression,
             "breaking_change": self.breaking_change or self.callee_name,
+            # AST position & argument shape
+            "col_offset": self.col_offset,
+            "end_line": self.end_line,
+            "end_col_offset": self.end_col_offset,
+            "positional_args_count": self.positional_args_count,
+            "keyword_args": list(self.keyword_args),
+            "has_varargs": self.has_varargs,
+            "has_varkwargs": self.has_varkwargs,
+            "is_from_library": self.is_from_library,
+            "compatibility": self.compatibility,
+            "is_removal": self.is_removal,
         }
 
 
@@ -114,22 +135,30 @@ class CallGraph:
 class CallGraphVisitor(ast.NodeVisitor):
     """AST visitor that walks Python source code and extracts all function/method call sites."""
 
-    def __init__(self, file_path: str) -> None:
+    def __init__(self, file_path: str, library_name: Optional[str] = None) -> None:
         self.file_path = file_path
+        self.library_name = library_name
         # Stack tracking current enclosing scopes (classes and functions)
         self.scope_stack: list[str] = []
         # Import alias mapping: local_name -> original_symbol_name
         self.aliases: dict[str, str] = {}
+        # Library-specific imports in this file: local_name -> target_symbol
+        self.imported_from_lib: dict[str, str] = {}
+        # Library-specific module alias prefixes: e.g. 'shopkit', 'sk'
+        self.lib_prefixes: set[str] = set()
+        # Locally defined functions and classes in this file
+        self.local_definitions: set[str] = set()
         # Collected call sites in this file
         self.call_sites: list[CallSite] = []
 
     def visit_Import(self, node: ast.Import) -> None:
         """Track import aliases, e.g. `import mypkg as mp`."""
         for alias in node.names:
-            if alias.asname:
-                self.aliases[alias.asname] = alias.name
-            else:
-                self.aliases[alias.name] = alias.name
+            as_name = alias.asname or alias.name
+            self.aliases[as_name] = alias.name
+            if self.library_name:
+                if alias.name == self.library_name or alias.name.startswith(self.library_name + "."):
+                    self.lib_prefixes.add(as_name)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -138,22 +167,28 @@ class CallGraphVisitor(ast.NodeVisitor):
             original = alias.name
             as_name = alias.asname or alias.name
             self.aliases[as_name] = original
+            if self.library_name and node.module:
+                if node.module == self.library_name or node.module.startswith(self.library_name + "."):
+                    self.imported_from_lib[as_name] = original
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Track entering and leaving a function definition."""
+        self.local_definitions.add(node.name)
         self.scope_stack.append(node.name)
         self.generic_visit(node)
         self.scope_stack.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Track entering and leaving an async function definition."""
+        self.local_definitions.add(node.name)
         self.scope_stack.append(node.name)
         self.generic_visit(node)
         self.scope_stack.pop()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Track entering and leaving a class definition."""
+        self.local_definitions.add(node.name)
         self.scope_stack.append(node.name)
         self.generic_visit(node)
         self.scope_stack.pop()
@@ -166,43 +201,69 @@ class CallGraphVisitor(ast.NodeVisitor):
         else:
             caller_name = "<module>"
 
-        # 2. Extract callee name and qualified callee representation
+        # 2. Extract callee name, qualified callee representation, and library binding
         callee_name = ""
         qualified_callee = ""
+        is_from_lib = True if self.library_name is None else False
 
         if isinstance(node.func, ast.Name):
-            # Direct call: func()
             raw_id = node.func.id
             callee_name = self.aliases.get(raw_id, raw_id)
             qualified_callee = callee_name
+            if self.library_name is not None:
+                if raw_id in self.local_definitions and raw_id not in self.imported_from_lib:
+                    is_from_lib = False
+                elif raw_id in self.imported_from_lib:
+                    is_from_lib = True
+                    callee_name = self.imported_from_lib[raw_id]
+                    qualified_callee = f"{self.library_name}.{callee_name}"
+                else:
+                    is_from_lib = False
 
         elif isinstance(node.func, ast.Attribute):
-            # Attribute/method call: obj.method()
             callee_name = node.func.attr
+            val_repr = ""
             try:
                 val_repr = ast.unparse(node.func.value)
-                # Resolve alias if base object is aliased
                 val_resolved = self.aliases.get(val_repr, val_repr)
                 qualified_callee = f"{val_resolved}.{callee_name}"
             except Exception:
                 qualified_callee = callee_name
 
+            if self.library_name is not None:
+                if val_repr in self.lib_prefixes:
+                    is_from_lib = True
+                    qualified_callee = f"{self.library_name}.{callee_name}"
+                elif val_repr.startswith(self.library_name + ".") or val_repr == self.library_name:
+                    is_from_lib = True
+                else:
+                    is_from_lib = False
+
         else:
-            # Complex call expression: get_handler()()
             try:
                 callee_name = ast.unparse(node.func)
                 qualified_callee = callee_name
             except Exception:
                 callee_name = "<unknown>"
                 qualified_callee = "<unknown>"
+            if self.library_name is not None:
+                is_from_lib = False
 
-        # 3. Unparse the call expression for clear diagnostics
+        # 3. Unparse the call expression
         try:
             expr_str = ast.unparse(node)
         except Exception:
             expr_str = f"{callee_name}(...)"
 
-        # 4. Construct CallSite and record it
+        # 4. AST position and argument shape
+        col_offset = getattr(node, "col_offset", 0)
+        end_line = getattr(node, "end_lineno", None)
+        end_col_offset = getattr(node, "end_col_offset", None)
+        pos_count = len(node.args)
+        kw_names = [kw.arg for kw in node.keywords if kw.arg is not None]
+        has_varargs = any(isinstance(a, ast.Starred) for a in node.args)
+        has_varkwargs = any(kw.arg is None for kw in node.keywords)
+
         site = CallSite(
             file_path=self.file_path,
             line_number=getattr(node, "lineno", 0),
@@ -210,18 +271,28 @@ class CallGraphVisitor(ast.NodeVisitor):
             callee_name=callee_name,
             qualified_callee=qualified_callee,
             call_expression=expr_str,
+            col_offset=col_offset,
+            end_line=end_line,
+            end_col_offset=end_col_offset,
+            positional_args_count=pos_count,
+            keyword_args=kw_names,
+            has_varargs=has_varargs,
+            has_varkwargs=has_varkwargs,
+            is_from_library=is_from_lib,
         )
         self.call_sites.append(site)
-
-        # 5. Continue visiting nested calls (e.g. func(nested_call()))
         self.generic_visit(node)
 
 
-def build_call_graph(project_path: Union[str, Path]) -> CallGraph:
+def build_call_graph(
+    project_path: Union[str, Path],
+    library_name: Optional[str] = None,
+) -> CallGraph:
     """Build a CallGraph for a Python project or single file using the AST module.
 
     Args:
         project_path: Path to a Python source file or project directory.
+        library_name: Optional library package name for resolving imports.
 
     Returns:
         CallGraph: The constructed call graph.
@@ -254,7 +325,7 @@ def build_call_graph(project_path: Union[str, Path]) -> CallGraph:
         try:
             source = file_path.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=str(file_path))
-            visitor = CallGraphVisitor(file_path=str(file_path))
+            visitor = CallGraphVisitor(file_path=str(file_path), library_name=library_name)
             visitor.visit(tree)
 
             call_graph.analyzed_files.append(str(file_path))
@@ -412,10 +483,19 @@ def is_call_affected(
     return False, None
 
 
+class AffectedCallSitesList(list):
+    """List of affected call sites retaining unaffected call sites for transparency."""
+
+    def __init__(self, items: Any = None, unaffected: Any = None) -> None:
+        super().__init__(items or [])
+        self.unaffected: list[dict[str, Any]] = list(unaffected or [])
+
+
 def get_affected_call_sites(
     project_path: Union[str, Path],
     breaking_changes: Any,
-) -> list[dict[str, Any]]:
+    library_name: Optional[str] = None,
+) -> AffectedCallSitesList:
     """Find all call sites in a project affected by breaking changes.
 
     Builds a simple AST call graph of the project, matches calls against
@@ -426,41 +506,72 @@ def get_affected_call_sites(
         project_path: Path to the Python file or project directory to analyze.
         breaking_changes: Breaking changes from `api_diff` (dict, list of strings,
             or list of change dicts).
+        library_name: Optional library package name for resolving imports.
 
     Returns:
-        list[dict]: List of affected call site dictionaries, each containing:
-            - 'file_path': str (path to the file containing the call)
-            - 'function_name': str (function name)
-            - 'line_number': int (line number of the call)
-            - 'caller_name': str (enclosing function in project)
-            - 'callee_name': str (called broken function)
-            - 'call_expression': str (unparsed call expression)
-            - 'breaking_change': str (matching broken symbol)
+        AffectedCallSitesList: List of affected call site dictionaries with .unaffected list.
     """
     # Gracefully support swapped arguments if passed as (breaking_changes, project_path)
     if isinstance(project_path, (dict, list)) and isinstance(breaking_changes, (str, Path)):
         project_path, breaking_changes = breaking_changes, project_path
 
     # Step 1: Build the call graph using Python's AST module
-    call_graph = build_call_graph(project_path)
+    call_graph = build_call_graph(project_path, library_name=library_name)
 
     # Step 2: Extract normalized set of breaking symbols from api_diff output
     broken_symbols = extract_breaking_symbols(breaking_changes)
 
-    # Step 3: Match every call site in the call graph against the broken symbols
-    affected_sites: list[dict[str, Any]] = []
+    # Index changed signatures by name/callee for argument-aware compatibility check
+    sig_map: dict[str, dict[str, Any]] = {}
+    if isinstance(breaking_changes, dict):
+        for sig in breaking_changes.get("changed_signatures", []):
+            if isinstance(sig, dict) and "name" in sig:
+                name = sig["name"]
+                sig_map[name] = sig
+                if "." in name:
+                    sig_map[name.split(".")[-1]] = sig
 
+    affected_sites: list[dict[str, Any]] = []
+    unaffected_sites: list[dict[str, Any]] = []
+
+    from .call_compat import check_call_compatibility
+
+    # Step 3: Match every call site in the call graph against the broken symbols
     for site in call_graph.get_all_call_sites():
+        if library_name is not None and not site.is_from_library:
+            continue
+
         is_broken, matched_symbol = is_call_affected(
             callee=site.callee_name,
             qualified=site.qualified_callee,
             breaking_symbols=broken_symbols,
         )
-        if is_broken:
-            site.breaking_change = matched_symbol
-            affected_sites.append(site.to_dict())
+        if not is_broken:
+            continue
 
-    return affected_sites
+        site.breaking_change = matched_symbol
+        site_dict = site.to_dict()
+        if library_name is not None:
+            site_dict["library_name"] = library_name
+
+        sig_info = sig_map.get(site.callee_name) or sig_map.get(matched_symbol)
+        if sig_info is not None:
+            old_fn = sig_info.get("old_fn") or sig_info.get("old_signature")
+            new_fn = sig_info.get("new_fn") or sig_info.get("new_signature")
+            compat = check_call_compatibility(old_fn, new_fn, site)
+            site_dict["compatibility"] = compat
+            site_dict["is_removal"] = False
+
+            if compat == "fits":
+                unaffected_sites.append(site_dict)
+            else:
+                affected_sites.append(site_dict)
+        else:
+            site_dict["compatibility"] = "breaks"
+            site_dict["is_removal"] = True
+            affected_sites.append(site_dict)
+
+    return AffectedCallSitesList(affected_sites, unaffected=unaffected_sites)
 
 
 # Convenient alias
