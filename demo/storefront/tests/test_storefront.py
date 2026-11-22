@@ -95,3 +95,40 @@ def test_promo_code_applies(client):
     response = client.post("/cart/promo", data={"promo_code": "SAVE10"}, follow_redirects=True)
     assert response.status_code == 200
     assert "106.20" in response.get_data(as_text=True)
+
+
+@pytest.mark.smoke
+def test_search_is_case_insensitive(client):
+    """TENT, Tent, and tent all return the same non-empty product set."""
+    r_upper = client.get("/products?q=TENT")
+    r_mixed = client.get("/products?q=Tent")
+    r_lower = client.get("/products?q=tent")
+    assert r_upper.status_code == 200
+    assert r_mixed.status_code == 200
+    assert r_lower.status_code == 200
+    assert "Tent" in r_upper.get_data(as_text=True)
+    assert "Tent" in r_mixed.get_data(as_text=True)
+    assert "Tent" in r_lower.get_data(as_text=True)
+
+
+@pytest.mark.smoke
+def test_home_has_search_form(client):
+    """Home page contains a search form with field named q."""
+    response = client.get("/")
+    assert response.status_code == 200
+    text = response.get_data(as_text=True)
+    assert 'name="q"' in text
+    assert '<form' in text
+
+
+@pytest.mark.smoke
+def test_new_products_appear(client):
+    """Each new product is reachable through search by name."""
+    new_product_names = [
+        "Sleeping Bag", "Hiking Boots", "Rain Jacket",
+        "Water Filter", "Headlamp", "Trekking Poles"
+    ]
+    for name in new_product_names:
+        response = client.get(f"/products?q={name}")
+        assert response.status_code == 200
+        assert name in response.get_data(as_text=True), f"{name} not found in search"

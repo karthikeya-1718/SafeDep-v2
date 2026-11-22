@@ -6,9 +6,10 @@
       <h1 class="text-3xl font-extrabold">Gear Up for Adventure</h1>
       <p class="mt-2 text-indigo-100">Premium outdoor equipment with tax-inclusive transparent pricing.</p>
     </div>
-    <a href="/products" class="mt-4 md:mt-0 bg-white text-indigo-700 px-6 py-2.5 rounded-lg font-semibold shadow hover:bg-indigo-50">
-      Browse Catalog &rarr;
-    </a>
+    <form action="/products" method="GET" class="mt-4 md:mt-0 flex">
+      <input type="text" name="q" placeholder="Search products..." class="border border-slate-300 rounded-l-md px-3 py-2 text-slate-900 text-sm focus:outline-none">
+      <button type="submit" class="bg-white text-indigo-700 px-4 py-2 rounded-r-md font-semibold shadow hover:bg-indigo-50 text-sm">Search</button>
+    </form>
   </div>
 
   <div>
