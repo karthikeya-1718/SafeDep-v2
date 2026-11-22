@@ -174,6 +174,8 @@ def compare_classes(
                     "new_line": m_new.line,
                     "module": module_name,
                     "reasons": reasons,
+                    "old_fn": m_old,
+                    "new_fn": m_new,
                 })
 
     # Check removed base classes
@@ -242,6 +244,8 @@ def compare_modules(
                     "new_line": f_new.line,
                     "module": mod_name,
                     "reasons": reasons,
+                    "old_fn": f_old,
+                    "new_fn": f_new,
                 })
 
     # 4. Classes common to both versions

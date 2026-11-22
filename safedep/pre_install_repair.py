@@ -223,6 +223,7 @@ def analyze_pre_install_issues(
     client_path: Union[str, Path],
     api_key: Optional[str] = None,
     deepseek_model: str = "deepseek-chat",
+    library_name: Optional[str] = None,
 ) -> PreInstallRepairReport:
     """Analyze a client project against a proposed library upgrade.
 
@@ -235,14 +236,22 @@ def analyze_pre_install_issues(
       - Fixable syntactical/signature changes (generates patches via DeepSeek)
       - Deferred behavioral issues (noted for post-installation runtime verification)
     """
+    if library_name is None:
+        try:
+            from .environment import resolve_library_source
+            lib_src = resolve_library_source(new_path)
+            library_name = lib_src.name
+        except Exception:
+            library_name = None
+
     # 1. Run api_diff to find breaking changes in the library
     diff_result = get_breaking_changes(old_path, new_path)
 
     # 2. Run call_graph to find affected call sites in the client project
-    raw_call_sites = get_affected_call_sites(client_path, diff_result)
+    raw_call_sites = get_affected_call_sites(client_path, diff_result, library_name=library_name)
 
     # 3. Run risk_ranker to assign risk scores and sort by impact
-    ranked_call_sites = rank_affected_call_sites(raw_call_sites, project_path=client_path)
+    ranked_call_sites = rank_affected_call_sites(raw_call_sites, project_path=client_path, library_name=library_name)
 
     syntactical_issues: list[RepairIssue] = []
     behavioral_issues: list[RepairIssue] = []
@@ -579,6 +588,7 @@ def run_pre_install_repair(
     install_target: Optional[str] = None,
     interactive: bool = False,
     is_demo_case_1: bool = False,
+    library_name: Optional[str] = None,
 ) -> PreInstallRepairReport:
     """Orchestrate the complete Pre-Install Repair workflow.
 
@@ -608,6 +618,7 @@ def run_pre_install_repair(
         new_path=new_path,
         client_path=client_path,
         api_key=api_key,
+        library_name=library_name,
     )
 
     # 2. Display the clear report

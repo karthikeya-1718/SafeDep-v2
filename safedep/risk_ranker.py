@@ -117,11 +117,13 @@ def rank_affected_call_sites(
     affected_call_sites: list[dict[str, Any]],
     call_graph: Optional[Any] = None,
     project_path: Optional[Union[str, Path]] = None,
+    tier_ordering: Optional[bool] = None,
+    library_name: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Assign risk scores to affected call sites and return them sorted from highest to lowest risk.
 
     Scoring is based on:
-      1. Call count: Number of times the broken function is called across call sites.
+      1. Call count: Number of times the broken function is called across breaking call sites.
       2. Call chain depth: Depth of the function in the execution call chain (BFS from entry points).
 
     Simple and Explainable Formula:
@@ -131,16 +133,12 @@ def rank_affected_call_sites(
         affected_call_sites: List of call site dicts from `get_affected_call_sites()`.
         call_graph: Optional CallGraph instance.
         project_path: Optional path to project directory or file to build call graph.
+        tier_ordering: Whether to use startup-first tier ordering. Defaults to True when library_name
+            is provided or present on sites, False for legacy calls.
+        library_name: Optional library name.
 
     Returns:
-        list[dict]: New list of enriched call site dictionaries sorted from
-            highest risk to lowest risk. Each item contains:
-            - 'risk_score': float / int (call_count * depth)
-            - 'call_count': int (how many times the function is called)
-            - 'depth': int (call chain depth >= 1)
-            - 'risk_level': str ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW')
-            - 'risk_explanation': str (plain English explanation of score)
-            - All original call site fields (file_path, function_name, line_number, etc.)
+        list[dict]: Enriched call site dictionaries sorted by risk/tier.
     """
     if not affected_call_sites:
         return []
@@ -149,31 +147,33 @@ def rank_affected_call_sites(
     active_graph = call_graph
     if active_graph is None and project_path is not None and build_call_graph is not None:
         try:
-            active_graph = build_call_graph(project_path)
+            active_graph = build_call_graph(project_path, library_name=library_name)
         except Exception:
             active_graph = None
 
-    # Step 2: Calculate call frequency (how many times each function is called)
+    # Step 2: Calculate call frequency strictly over sites that really break
     call_counts: dict[str, int] = defaultdict(int)
     for site in affected_call_sites:
         fn_name = site.get("callee_name") or site.get("callee") or str(site.get("function_name", "unknown"))
         call_counts[fn_name] += 1
 
-    # If active call graph is available, count overall occurrences in the project
+    # Map number of distinct callers reaching each enclosing function
+    distinct_callers: dict[str, set[str]] = defaultdict(set)
     if active_graph is not None and hasattr(active_graph, "all_call_sites"):
-        project_counts: dict[str, int] = defaultdict(int)
         for s in active_graph.all_call_sites:
-            callee = getattr(s, "callee_name", "")
-            if callee:
-                project_counts[callee] += 1
-        for fn in call_counts:
-            if fn in project_counts:
-                call_counts[fn] = max(call_counts[fn], project_counts[fn])
+            c_name = getattr(s, "caller_name", "")
+            fn = getattr(s, "callee_name", "")
+            if fn and c_name:
+                distinct_callers[fn].add(c_name)
 
     # Step 3: Compute call chain depth for all functions
     depth_map = compute_call_depths(affected_call_sites, call_graph=active_graph)
 
-    # Step 4: Enrich each call site with call_count, depth, risk_score, and explanation
+    # Determine if tier ordering should be used
+    if tier_ordering is None:
+        tier_ordering = bool(library_name or any(s.get("library_name") for s in affected_call_sites))
+
+    # Step 4: Enrich each call site with when_fails, fixability, call_count, depth, risk_score
     ranked_sites: list[dict[str, Any]] = []
 
     for site in affected_call_sites:
@@ -186,19 +186,16 @@ def rank_affected_call_sites(
         count = call_counts.get(callee, 1)
 
         # 2. Determine call chain depth
-        # Depth of the callee from BFS, or caller depth + 1, with a minimum of 1
         if callee in depth_map:
             depth = depth_map[callee]
         elif caller in depth_map:
             depth = depth_map[caller] + 1
         else:
-            # Fallback based on caller scope depth
             depth = 1 + (caller.count(".") if caller != "<module>" else 0)
 
         depth = max(1, depth)
 
         # 3. Simple, explainable risk score calculation:
-        # risk_score = call_count * depth
         score = float(count * depth)
         level = get_risk_level(score)
 
@@ -207,28 +204,62 @@ def rank_affected_call_sites(
             f"(risk score = {count} x {depth} = {score:.1f})"
         )
 
+        when_fails = "startup" if caller == "<module>" else "on_call"
+
+        # Fixability: auto for signature changes judged breaks, manual for removals, review for uncertain
+        compat = site.get("compatibility", "breaks")
+        is_removal = site.get("is_removal", False)
+        if is_removal:
+            fixability = "manual"
+        elif compat == "uncertain":
+            fixability = "review"
+        else:
+            fixability = "auto"
+
+        num_callers = len(distinct_callers.get(caller, set()))
+
         site_copy["call_count"] = count
         site_copy["depth"] = depth
         site_copy["risk_score"] = score
         site_copy["risk_level"] = level
         site_copy["risk_explanation"] = explanation
+        site_copy["when_fails"] = when_fails
+        site_copy["fixability"] = fixability
+        site_copy["num_distinct_callers"] = num_callers
 
         ranked_sites.append(site_copy)
 
-    # Step 5: Sort from highest risk to lowest risk
-    # Primary key: risk_score descending
-    # Secondary key: call_count descending
-    # Tertiary key: depth descending
-    # Final tie-breaker: file_path and line_number ascending for deterministic ordering
-    ranked_sites.sort(
-        key=lambda s: (
-            -s["risk_score"],
-            -s["call_count"],
-            -s["depth"],
-            str(s.get("file_path", "")),
-            int(s.get("line_number", 0)),
+    # Step 5: Sort
+    if tier_ordering:
+        ranked_sites.sort(
+            key=lambda s: (
+                0 if s["when_fails"] == "startup" else 1,
+                -s["depth"],
+                -s.get("num_distinct_callers", 0),
+                str(s.get("file_path", "")),
+                int(s.get("line_number", 0)),
+            )
         )
-    )
+    else:
+        # Legacy sorting preserved for callers without library binding
+        ranked_sites.sort(
+            key=lambda s: (
+                -s["risk_score"],
+                -s["call_count"],
+                -s["depth"],
+                str(s.get("file_path", "")),
+                int(s.get("line_number", 0)),
+            )
+        )
+
+    # Forward unaffected sites attribute if present
+    unaffected = getattr(affected_call_sites, "unaffected", None)
+    if unaffected is not None:
+        try:
+            from .call_graph import AffectedCallSitesList
+            return AffectedCallSitesList(ranked_sites, unaffected=unaffected)
+        except ImportError:
+            pass
 
     return ranked_sites
 
@@ -241,39 +272,54 @@ rank_call_sites = rank_affected_call_sites
 score_and_rank_call_sites = rank_affected_call_sites
 
 
-def format_risk_report(ranked_call_sites: list[dict[str, Any]], title: str = "SafeDep Risk-Ranked Call Sites") -> str:
+def format_risk_report(
+    ranked_call_sites: list[dict[str, Any]],
+    title: str = "SafeDep Risk-Ranked Call Sites",
+    unaffected_count: Optional[int] = None,
+) -> str:
     """Format the risk-ranked call sites into an attractive, clear terminal report."""
     border = "=" * 70
     sub_border = "-" * 70
     total = len(ranked_call_sites)
+
+    unaffected = getattr(ranked_call_sites, "unaffected", None)
+    if unaffected_count is None and unaffected is not None:
+        unaffected_count = len(unaffected)
 
     lines = [
         border,
         f"  {title.upper()}",
         border,
         f"Total Call Sites Analyzed: {total}",
+    ]
+
+    if unaffected_count is not None:
+        checked = total + unaffected_count
+        lines.append(f"Checked {checked} call site(s): {total} breaking, {unaffected_count} still fit the new version.")
+
+    lines.extend([
         "Scoring Methodology: Risk Score = (Call Frequency) x (Call Chain Depth)",
         sub_border,
-    ]
+    ])
 
     if not total:
         lines.append("[OK] No affected call sites to rank.")
         lines.append(border)
         return "\n".join(lines)
 
-    lines.append(f"{'RANK':<5} | {'RISK':<8} | {'SCORE':<6} | {'FUNCTION':<20} | {'LOCATION':<24}")
-    lines.append("-" * 70)
+    lines.append(f"{'RANK':<5} | {'RISK':<8} | {'WHEN':<8} | {'FUNCTION':<24} | {'LOCATION':<22} | {'FIX':<6}")
+    lines.append("-" * 80)
 
     for idx, s in enumerate(ranked_call_sites, 1):
         callee = s.get("callee_name") or s.get("callee") or str(s.get("function_name", "unknown"))
         file_name = Path(s.get("file_path", "unknown")).name
         line_no = s.get("line_number", "?")
         location = f"{file_name}:{line_no}"
-        score = s.get("risk_score", 0.0)
         level = s.get("risk_level", "LOW")
+        when = s.get("when_fails", "on_call")
+        fix = s.get("fixability", "auto")
 
-        lines.append(f"#{idx:<4} | {level:<8} | {score:<6.1f} | {callee:<20} | {location:<24}")
-        lines.append(f"       -> Details: {s.get('risk_explanation', '')}")
+        lines.append(f"#{idx:<4} | {level:<8} | {when:<8} | {callee:<24} | {location:<22} | {fix:<6}")
 
     lines.append(border)
     return "\n".join(lines)
