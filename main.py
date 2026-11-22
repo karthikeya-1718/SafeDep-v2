@@ -406,6 +406,48 @@ def _handle_post_repair_demo_case_2(
     return 0
 
 
+def handle_env_info(args: argparse.Namespace) -> int:
+    """Execute `safedep env-info`: Print installed version of package."""
+    from safedep.environment import installed_version
+
+    ver = installed_version(args.python, args.package)
+    if ver is None:
+        print(f"{args.package}: not installed")
+        return 1
+    print(ver)
+    return 0
+
+
+def handle_snapshots(args: argparse.Namespace) -> int:
+    """Execute `safedep snapshots`: List or restore file snapshots."""
+    from safedep.snapshot import list_snapshots, restore_snapshot
+
+    project_root = _validate_path(args.project, "Project directory")
+
+    if args.snapshot_command == "list":
+        snaps = list_snapshots(project_root)
+        if not snaps:
+            print(f"No snapshots found for {project_root}")
+            return 0
+        print(f"Snapshots for {project_root}:")
+        for s in snaps:
+            print(f"  [{s.snapshot_id}] label='{s.label}' created={s.created_at} ({len(s.entries)} files)")
+        return 0
+
+    elif args.snapshot_command == "restore":
+        try:
+            restored = restore_snapshot(project_root, args.snapshot_id)
+            print(f"Restored snapshot {args.snapshot_id}:")
+            for r in restored:
+                print(f"  {r}")
+            return 0
+        except Exception as exc:
+            print(f"[ERROR] Restore failed: {exc}", file=sys.stderr)
+            return 1
+
+    return 0
+
+
 def _demo2_run_initial_tests(test_p: Path) -> None:
     """Show the initial failing test run for Demo Case 2."""
     from safedep.post_install_repair import run_pytest
@@ -670,6 +712,30 @@ Examples:
         description="Run an end-to-end demonstration comparing APIs, computing call graphs, ranking risk, and executing pre/post repair.",
     )
 
+    # Command: env-info
+    p_env = subparsers.add_parser(
+        "env-info",
+        help="Display installed version of a package in a Python environment",
+        description="Check installed distribution version using importlib.metadata in the target environment.",
+    )
+    p_env.add_argument("--python", required=True, help="Path to python executable")
+    p_env.add_argument("--package", required=True, help="Distribution package name")
+
+    # Command: snapshots
+    p_snap = subparsers.add_parser(
+        "snapshots",
+        help="Manage project file snapshots for safe rollback",
+        description="Create, list, and restore hash-verified snapshots under .safedep/snapshots/.",
+    )
+    snap_sub = p_snap.add_subparsers(dest="snapshot_command", required=True)
+
+    p_snap_list = snap_sub.add_parser("list", help="List recorded snapshots")
+    p_snap_list.add_argument("--project", required=True, help="Path to project root")
+
+    p_snap_restore = snap_sub.add_parser("restore", help="Restore a recorded snapshot")
+    p_snap_restore.add_argument("--project", required=True, help="Path to project root")
+    p_snap_restore.add_argument("--id", required=True, dest="snapshot_id", help="Snapshot ID to restore")
+
     return parser
 
 
@@ -681,7 +747,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Backwards compatibility: if invoked with two file paths directly without a subcommand
     # e.g.: `python main.py old.py new.py` -> rewrite as `analyze old.py new.py`
-    if raw_args and not raw_args[0].startswith("-") and raw_args[0] not in ("analyze", "pre-repair", "post-repair", "demo"):
+    if raw_args and not raw_args[0].startswith("-") and raw_args[0] not in ("analyze", "pre-repair", "post-repair", "demo", "env-info", "snapshots"):
         raw_args = ["analyze"] + raw_args
 
     args = parser.parse_args(raw_args)
@@ -700,6 +766,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return handle_pre_repair(args)
     elif args.command == "post-repair":
         return handle_post_repair(args)
+    elif args.command == "env-info":
+        return handle_env_info(args)
+    elif args.command == "snapshots":
+        return handle_snapshots(args)
 
     parser.print_help()
     return 0

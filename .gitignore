@@ -37,6 +37,8 @@ ENV/
 env.bak/
 venv.bak/
 test-v1/
+.safedep_envs/
+.safedep/
 
 # Testing
 .pytest_cache/
