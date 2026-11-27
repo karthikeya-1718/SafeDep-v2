@@ -338,6 +338,10 @@ def handle_pre_repair(args: argparse.Namespace) -> int:
     except Exception:
         library_name = None
 
+    dry_run = getattr(args, "dry_run", False)
+    project_root = getattr(args, "project_root", None)
+    target_python = getattr(args, "python", None)
+
     try:
         report = run_pre_install_repair(
             old_path=old_p,
@@ -347,6 +351,9 @@ def handle_pre_repair(args: argparse.Namespace) -> int:
             interactive=is_interactive,
             is_demo_case_1=is_demo_case_1,
             library_name=library_name,
+            project_root=project_root,
+            dry_run=dry_run,
+            python=target_python,
         )
     except Exception as exc:
         print(f"\n[ERROR] Pre-install repair failed: {exc}", file=sys.stderr)
@@ -716,6 +723,9 @@ Examples:
         default="report_only",
         help="Action to execute (default: report_only)",
     )
+    p_pre.add_argument("--dry-run", action="store_true", help="Preview patch diffs without modifying files")
+    p_pre.add_argument("--project-root", dest="project_root", default=None, help="Root path of the project for snapshots")
+    p_pre.add_argument("--python", dest="python", default=None, help="Path to target python executable for installation")
     p_pre.add_argument("--json", action="store_true", help="Output report in JSON format")
 
     # Command: post-repair

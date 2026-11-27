@@ -2,23 +2,22 @@
 
 Implements the Pre-Install Repair mode:
 1. Combines `api_diff`, `call_graph`, and `risk_ranker` to identify and prioritize affected call sites.
-2. Generates patches for syntactical/signature-level breaking changes using the shared
-   `patcher` module (DeepSeek API with an intelligent AST-based fallback).
-3. Produces a clear pre-installation report:
-   - Total issues found
-   - How many syntactical issues can be fixed now
-   - Explanatory note that behavioral issues can only be detected after installation
-4. Offers the user 3 explicit execution options:
-   - [1] Apply fixes and install the new library
-   - [2] Apply fixes only
-   - [3] Only show report
-
-Behavioral issues are explicitly deferred to post-installation testing.
+2. Generates patches for syntactical/signature-level breaking changes using deterministic
+   `call_fixer` (R2/R3 rules) with strict fallback/AI guard (R5).
+3. Produces a clear pre-installation report with summary counts, diffs, and a NEEDS YOU box.
+4. Offers execution options:
+   - apply_and_install: Apply fixes and install the new library into specified python
+   - apply_only: Apply fixes only
+   - report_only: Only show report
+   - dry_run: Preview diffs without modifying files
+5. R4 Safety: Snapshots taken before edits, AST verification after edits with automatic rollback.
 """
 
 from __future__ import annotations
 
+import ast
 import difflib
+import os
 import shutil
 import subprocess
 import sys
@@ -27,9 +26,20 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from .api_diff import get_breaking_changes
+from .call_compat import check_call_compatibility
+from .call_fixer import (
+    FixResult,
+    _abs_range,
+    _build_breaking_change_map,
+    apply_span_edit,
+    fix_call,
+    patch_file,
+)
 from .call_graph import get_affected_call_sites
+from .environment import install_library
 from .patcher import propose_patch
 from .risk_ranker import rank_affected_call_sites
+from .snapshot import create_snapshot, restore_snapshot
 
 
 @dataclass
@@ -51,6 +61,10 @@ class RepairIssue:
     patch_diff: Optional[str] = None
     explanation: str = ""
     is_removal: bool = False  # True when the function/method no longer exists at all
+    fix_status: str = "applied"  # "applied", "manual", "review", "failed"
+    col_offset: int = 0
+    end_line: int = 0
+    end_col_offset: int = 0
 
 
 @dataclass
@@ -66,15 +80,23 @@ class PreInstallRepairReport:
     unified_diffs: dict[str, str] = field(default_factory=dict)  # file_path -> unified diff text
     applied: bool = False
     installed: bool = False
+    applied_count: int = 0
+    manual_count: int = 0
+    review_count: int = 0
+    failed_count: int = 0
+    snapshot_id: Optional[str] = None
+    project_root: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert report to dictionary format."""
-        auto_fixable = [i for i in self.syntactical_issues if not i.is_removal]
-        manual_required = [i for i in self.syntactical_issues if i.is_removal]
+        auto_fixable = [i for i in self.syntactical_issues if i.fix_status == "applied"]
+        manual_required = [i for i in self.syntactical_issues if i.fix_status == "manual"]
+        review_required = [i for i in self.syntactical_issues if i.fix_status == "review"]
         return {
             "total_issues": self.total_issues,
             "auto_fixable_signature_changes": len(auto_fixable),
             "manual_intervention_required": len(manual_required),
+            "review_required": len(review_required),
             "syntactical_issues_fixable_now": self.syntactical_count,
             "behavioral_issues_deferred": self.behavioral_count,
             "syntactical_issues": [
@@ -90,6 +112,7 @@ class PreInstallRepairReport:
                     "proposed_fix": i.proposed_fix,
                     "patch_diff": i.patch_diff,
                     "is_removal": i.is_removal,
+                    "fix_status": i.fix_status,
                 }
                 for i in self.syntactical_issues
             ],
@@ -108,29 +131,21 @@ class PreInstallRepairReport:
             ],
             "applied": self.applied,
             "installed": self.installed,
+            "snapshot_id": self.snapshot_id,
         }
 
 
 def classify_issue(call_site: dict[str, Any], diff_result: dict[str, Any]) -> tuple[str, Optional[dict[str, Any]]]:
-    """Classify a call site issue as either 'syntactical' or 'behavioral'.
-
-    Syntactical / signature-level issues are detectable purely from the API diff:
-    - Removed functions, classes, or methods (call site can be flagged and removed/stubbed pre-install)
-    - Changed signatures (parameter added, removed, renamed, reordered, default value removed)
-
-    Behavioral issues are ONLY those where a function still exists but its runtime
-    behavior, return values, or side effects may have changed in ways not visible
-    from the signature/API diff alone -- not detectable pre-installation.
-    """
+    """Classify a call site issue as either 'syntactical' or 'behavioral'."""
     callee = str(call_site.get("callee_name") or call_site.get("function_name", ""))
     breaking_text = str(call_site.get("breaking_change", ""))
 
-    # 1. Explicitly removed functions -- detectable and flaggable pre-install
+    # 1. Explicitly removed functions
     for fn in diff_result.get("removed_functions", []):
         if fn.get("name") == callee:
             return "syntactical", None
 
-    # 2. Explicitly removed classes (constructor/instantiation calls)
+    # 2. Explicitly removed classes
     for cls in diff_result.get("removed_classes", []):
         if cls.get("name") == callee:
             return "syntactical", None
@@ -154,17 +169,13 @@ def classify_issue(call_site: dict[str, Any], diff_result: dict[str, Any]) -> tu
     ):
         return "syntactical", None
 
-    # 6. Only defer to behavioral if no structural evidence found in the diff --
-    #    i.e., the function still exists but may behave differently at runtime.
+    # 6. Behavioral if no structural evidence found in diff
     return "behavioral", None
 
 
 # ---------------------------------------------------------------------------
 # Backwards-compatibility shims
 # ---------------------------------------------------------------------------
-# The patch generation logic now lives in safedep.patcher.  The two names
-# below are kept so that any code (or tests) that imported them directly
-# from pre_install_repair continue to work without changes.
 
 
 def generate_patch_with_deepseek(
@@ -176,11 +187,7 @@ def generate_patch_with_deepseek(
     api_key: Optional[str] = None,
     model: str = "deepseek-chat",
 ) -> str:
-    """Thin shim -- delegates to :func:`safedep.patcher.propose_patch`.
-
-    .. deprecated::
-        Import :func:`safedep.patcher.propose_patch` directly instead.
-    """
+    """Thin shim -- delegates to safedep.patcher.propose_patch."""
     return propose_patch(
         code_snippet=call_expression,
         breaking_change_info={
@@ -200,12 +207,7 @@ def generate_fallback_patch(
     old_signature: Optional[str] = None,
     new_signature: Optional[str] = None,
 ) -> str:
-    """Thin shim -- delegates to the AST fallback inside :mod:`safedep.patcher`.
-
-    .. deprecated::
-        Import :func:`safedep.patcher.propose_patch` directly instead.
-    """
-    # Call propose_patch with no API key so it always takes the AST path
+    """Thin shim -- delegates to AST fallback inside safedep.patcher."""
     return propose_patch(
         code_snippet=call_expression,
         breaking_change_info={
@@ -213,8 +215,18 @@ def generate_fallback_patch(
             "old_signature": old_signature,
             "new_signature": new_signature,
         },
-        api_key="",  # empty string -- skip DeepSeek, go straight to AST engine
+        api_key="",
     )
+
+
+def _determine_project_root(client_path: Union[str, Path]) -> Path:
+    """Determine snapshot project root: parent of client if client has __init__.py, else client."""
+    cp = Path(client_path).resolve()
+    if cp.is_file():
+        cp = cp.parent
+    if (cp / "__init__.py").is_file():
+        return cp.parent
+    return cp
 
 
 def analyze_pre_install_issues(
@@ -224,17 +236,11 @@ def analyze_pre_install_issues(
     api_key: Optional[str] = None,
     deepseek_model: str = "deepseek-chat",
     library_name: Optional[str] = None,
+    project_root: Optional[Union[str, Path]] = None,
 ) -> PreInstallRepairReport:
     """Analyze a client project against a proposed library upgrade.
 
-    Combines:
-      - `api_diff` to detect breaking API changes
-      - `call_graph` to locate affected call sites
-      - `risk_ranker` to prioritize call sites by impact
-
-    Separates issues into:
-      - Fixable syntactical/signature changes (generates patches via DeepSeek)
-      - Deferred behavioral issues (noted for post-installation runtime verification)
+    Uses deterministic R2/R3 call_fixer for patch generation.
     """
     if library_name is None:
         try:
@@ -244,36 +250,45 @@ def analyze_pre_install_issues(
         except Exception:
             library_name = None
 
+    resolved_proj_root = Path(project_root).resolve() if project_root else _determine_project_root(client_path)
+
     # 1. Run api_diff to find breaking changes in the library
     diff_result = get_breaking_changes(old_path, new_path)
+    bc_map = _build_breaking_change_map(diff_result)
 
     # 2. Run call_graph to find affected call sites in the client project
     raw_call_sites = get_affected_call_sites(client_path, diff_result, library_name=library_name)
 
     # 3. Run risk_ranker to assign risk scores and sort by impact
-    ranked_call_sites = rank_affected_call_sites(raw_call_sites, project_path=client_path, library_name=library_name)
+    ranked_call_sites = rank_affected_call_sites(
+        raw_call_sites, project_path=client_path, tier_ordering=True, library_name=library_name
+    )
 
     syntactical_issues: list[RepairIssue] = []
     behavioral_issues: list[RepairIssue] = []
 
-    # Map file_path -> file content lines for patch extraction
-    file_lines_cache: dict[str, list[str]] = {}
+    # Cache file bytes
+    file_bytes_cache: dict[str, bytes] = {}
 
-    def get_lines(fp: str) -> list[str]:
-        if fp not in file_lines_cache:
+    def get_source_bytes(fp: str) -> bytes:
+        if fp not in file_bytes_cache:
             p = Path(fp)
             if p.is_file():
-                file_lines_cache[fp] = p.read_text(encoding="utf-8").splitlines(keepends=True)
+                file_bytes_cache[fp] = p.read_bytes()
             else:
-                file_lines_cache[fp] = []
-        return file_lines_cache[fp]
+                file_bytes_cache[fp] = b""
+        return file_bytes_cache[fp]
 
-    # 4. Classify issues and generate patches for syntactical/signature changes
+    # 4. Generate fixes for each call site
     for site in ranked_call_sites:
         issue_type, sig_meta = classify_issue(site, diff_result)
 
         fp = site.get("file_path", "")
         line_no = int(site.get("line_number", 0))
+        col_no = int(site.get("col_offset", 0))
+        end_line_no = int(site.get("end_line") or line_no)
+        end_col_no = int(site.get("end_col_offset", 0))
+
         callee = str(site.get("callee_name") or site.get("function_name", "unknown"))
         caller = str(site.get("caller_name") or site.get("caller", "<module>"))
         expr = str(site.get("call_expression", ""))
@@ -292,10 +307,9 @@ def analyze_pre_install_issues(
                 breaking = f"{breaking} ({reasons_str})"
 
         if issue_type == "syntactical":
-            # Determine whether this is a removal vs. a signature change.
-            # Removed symbols cannot be auto-patched to a valid call expression.
             is_removal = (
-                any(fn.get("name") == callee for fn in diff_result.get("removed_functions", []))
+                bool(site.get("is_removal"))
+                or any(fn.get("name") == callee for fn in diff_result.get("removed_functions", []))
                 or any(cls.get("name") == callee for cls in diff_result.get("removed_classes", []))
                 or any(
                     callee in (m.get("method_name", ""), f"{m.get('class_name','')}.{m.get('method_name','')}")
@@ -303,42 +317,63 @@ def analyze_pre_install_issues(
                 )
             )
 
+            # Get matching breaking change entry
+            bc_entry = bc_map.get(callee, sig_meta or {})
             if is_removal:
-                # Do NOT produce a code patch -- inserting English text into source is invalid Python.
-                # A commented-out line is provided as a safe, non-breaking suggestion.
-                proposed_fix = None
-                patch_diff = f"# {expr}  # TODO: `{callee}` was removed -- manual replacement required"
-            else:
-                # Extract surrounding context if file exists
-                lines = get_lines(fp)
-                ctx = ""
-                if lines and 1 <= line_no <= len(lines):
-                    start = max(0, line_no - 4)
-                    end = min(len(lines), line_no + 3)
-                    ctx = "".join(lines[start:end])
+                bc_entry = {"is_removal": True, **bc_entry}
 
-                # Generate fix via patcher (LLM API with AST fallback)
-                proposed_fix = propose_patch(
-                    code_snippet=expr,
-                    breaking_change_info={
-                        "breaking_change": breaking,
-                        "old_signature": old_sig,
-                        "new_signature": new_sig,
-                        "code_context": ctx,
-                    },
-                    api_key=api_key,
-                    model=deepseek_model,
-                )
+            src_bytes = get_source_bytes(fp)
+            # Invoke deterministic call_fixer
+            fix_res = fix_call(site, bc_entry, src_bytes)
 
-                # Generate inline diff preview only when we have a real code change
-                patch_diff = ""
+            status = fix_res.status
+            proposed_fix: Optional[str] = None
+            patch_diff: Optional[str] = None
+
+            if status == "review" and (api_key or os.environ.get("GROQ_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")):
+                # R5: Call remote provider ONLY for review sites if key configured
+                try:
+                    ai_answer = propose_patch(
+                        code_snippet=expr,
+                        breaking_change_info={
+                            "breaking_change": breaking,
+                            "old_signature": old_sig,
+                            "new_signature": new_sig,
+                        },
+                        api_key=api_key,
+                        model=deepseek_model,
+                    )
+                    # Validate AI answer: parseable, calls same function, call_compat fits
+                    ai_tree = ast.parse(ai_answer)
+                    if len(ai_tree.body) == 1 and isinstance(ai_tree.body[0], ast.Expr) and isinstance(ai_tree.body[0].value, ast.Call):
+                        ai_call = ai_tree.body[0].value
+                        ai_callee = ai_call.func.id if isinstance(ai_call.func, ast.Name) else (ai_call.func.attr if isinstance(ai_call.func, ast.Attribute) else "")
+                        if ai_callee == callee:
+                            compat = check_call_compatibility(bc_entry.get("old_fn") or old_sig, bc_entry.get("new_fn") or new_sig, ai_call)
+                            if compat == "fits":
+                                status = "applied"
+                                fix_res = FixResult(status="applied", new_call_bytes=ai_answer.encode("utf-8"), reason="AI patch validated")
+                except Exception:
+                    pass
+
+            if status == "applied" and fix_res.new_call_bytes is not None:
+                proposed_fix = fix_res.new_call_bytes.decode("utf-8", errors="replace")
                 if expr and proposed_fix and expr != proposed_fix:
                     patch_diff = f"- {expr}\n+ {proposed_fix}"
+            elif status == "manual":
+                proposed_fix = None
+                patch_diff = f"# {expr}  # TODO: `{callee}` was removed or requires manual fix"
+            elif status == "review":
+                proposed_fix = None
+                patch_diff = f"# {expr}  # REVIEW: requires human confirmation"
 
             syntactical_issues.append(
                 RepairIssue(
                     file_path=fp,
                     line_number=line_no,
+                    col_offset=col_no,
+                    end_line=end_line_no,
+                    end_col_offset=end_col_no,
                     function_name=callee,
                     caller_name=caller,
                     breaking_change=breaking,
@@ -351,6 +386,7 @@ def analyze_pre_install_issues(
                     proposed_fix=proposed_fix,
                     patch_diff=patch_diff,
                     is_removal=is_removal,
+                    fix_status=status,
                 )
             )
         else:
@@ -363,6 +399,9 @@ def analyze_pre_install_issues(
                 RepairIssue(
                     file_path=fp,
                     line_number=line_no,
+                    col_offset=col_no,
+                    end_line=end_line_no,
+                    end_col_offset=end_col_no,
                     function_name=callee,
                     caller_name=caller,
                     breaking_change=breaking,
@@ -371,19 +410,14 @@ def analyze_pre_install_issues(
                     risk_level=level,
                     call_expression=expr,
                     explanation=explanation,
+                    fix_status="review",
                 )
             )
 
-    # 5. Build file-level patched content and unified diffs
+    # 5. Build file-level patched content and unified diffs using bottom-up span edits (in memory)
     patched_files: dict[str, str] = {}
     unified_diffs: dict[str, str] = {}
 
-    # Check for library import updates (e.g. from old_library import ... -> from new_library import ...)
-    old_mod = Path(old_path).stem
-    new_mod = Path(new_path).stem
-    should_update_import = bool(old_mod != new_mod and old_mod and new_mod)
-
-    # Group syntactical issues by file
     by_file: dict[str, list[RepairIssue]] = {}
     for iss in syntactical_issues:
         by_file.setdefault(iss.file_path, []).append(iss)
@@ -392,44 +426,34 @@ def analyze_pre_install_issues(
         p = Path(file_path)
         if not p.is_file():
             continue
-        original_text = p.read_text(encoding="utf-8")
-        file_lines = original_text.splitlines(keepends=True)
+        original_bytes = p.read_bytes()
+        src_bytes = original_bytes
 
-        modified = False
-        # Sort issues by line number in reverse order to avoid line shifting
-        sorted_issues = sorted(issues, key=lambda x: x.line_number, reverse=True)
+        # Sort issues bottom-up by line and col
+        sorted_issues = sorted(
+            [iss for iss in issues if iss.fix_status == "applied" and iss.proposed_fix],
+            key=lambda x: (-x.line_number, -x.col_offset),
+        )
+
         for iss in sorted_issues:
-            # Never apply a patch for removals -- no valid replacement call can be generated.
-            # The commented-out suggestion in patch_diff is for the report only.
-            if iss.is_removal:
-                continue
-            if not iss.proposed_fix or not iss.call_expression:
-                continue
-            idx = iss.line_number - 1
-            if 0 <= idx < len(file_lines):
-                old_line = file_lines[idx]
-                if iss.call_expression in old_line:
-                    new_line = old_line.replace(iss.call_expression, iss.proposed_fix)
-                    file_lines[idx] = new_line
-                    modified = True
+            if iss.proposed_fix:
+                start_abs, end_abs = _abs_range(
+                    src_bytes, iss.line_number, iss.col_offset, iss.end_line, iss.end_col_offset
+                )
+                orig_call = src_bytes[start_abs:end_abs]
+                new_call = iss.proposed_fix.encode("utf-8")
+                if orig_call != new_call:
+                    src_bytes = apply_span_edit(
+                        src_bytes, iss.line_number, iss.col_offset, iss.end_line, iss.end_col_offset, new_call
+                    )
 
-        # Check and update import statement from old_library to new_library
-        if should_update_import:
-            for idx, line in enumerate(file_lines):
-                if f"from {old_mod} import" in line:
-                    file_lines[idx] = line.replace(f"from {old_mod} import", f"from {new_mod} import")
-                    modified = True
-                elif f"import {old_mod}" in line:
-                    file_lines[idx] = line.replace(f"import {old_mod}", f"import {new_mod}")
-                    modified = True
-
-        if modified:
-            new_text = "".join(file_lines)
+        if src_bytes != original_bytes:
+            new_text = src_bytes.decode("utf-8", errors="replace")
+            orig_text = original_bytes.decode("utf-8", errors="replace")
             patched_files[file_path] = new_text
 
-            # Compute unified diff
             diff = difflib.unified_diff(
-                original_text.splitlines(),
+                orig_text.splitlines(),
                 new_text.splitlines(),
                 fromfile=f"a/{Path(file_path).name}",
                 tofile=f"b/{Path(file_path).name}",
@@ -437,6 +461,10 @@ def analyze_pre_install_issues(
             )
             unified_diffs[file_path] = "\n".join(diff)
 
+    applied_count = sum(1 for i in syntactical_issues if i.fix_status == "applied")
+    manual_count = sum(1 for i in syntactical_issues if i.fix_status == "manual")
+    review_count = sum(1 for i in syntactical_issues if i.fix_status == "review") + len(behavioral_issues)
+    failed_count = sum(1 for i in syntactical_issues if i.fix_status == "failed")
     total_issues = len(syntactical_issues) + len(behavioral_issues)
 
     return PreInstallRepairReport(
@@ -447,6 +475,11 @@ def analyze_pre_install_issues(
         behavioral_issues=behavioral_issues,
         patched_files=patched_files,
         unified_diffs=unified_diffs,
+        applied_count=applied_count,
+        manual_count=manual_count,
+        review_count=review_count,
+        failed_count=failed_count,
+        project_root=str(resolved_proj_root),
     )
 
 
@@ -455,8 +488,9 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
     border = "=" * 70
     sub_border = "-" * 70
 
-    auto_fixable = [i for i in report.syntactical_issues if not i.is_removal]
-    manual_required = [i for i in report.syntactical_issues if i.is_removal]
+    auto_fixable = [i for i in report.syntactical_issues if i.fix_status == "applied"]
+    manual_required = [i for i in report.syntactical_issues if i.fix_status == "manual"]
+    review_required = [i for i in report.syntactical_issues if i.fix_status == "review"]
 
     lines = [
         border,
@@ -467,6 +501,7 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
         f"  * Auto-fixable signature changes:                     {len(auto_fixable)}",
         f"  * Removed functions/methods (manual intervention):    {len(manual_required)}",
         f"  * Behavioral / structural issues (deferred):          {report.behavioral_count}",
+        f"  * Summary: {len(auto_fixable)} edits to apply, {len(manual_required)} manual, {len(review_required) + report.behavioral_count} review",
         sub_border,
         "IMPORTANT NOTE ON BEHAVIORAL ISSUES:",
         "  [!] Behavioral and semantic issues (e.g., altered return value ranges,",
@@ -480,7 +515,7 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
     # Section 1a: Auto-fixable signature changes
     if auto_fixable:
         lines.append(f"\n[+] AUTO-FIXABLE SIGNATURE CHANGES ({len(auto_fixable)}):")
-        lines.append("    (Patches generated via LLM / AST Refactoring Engine)\n")
+        lines.append("    (Patches generated via Deterministic Call Fixer / R2 Rules)\n")
         for idx, iss in enumerate(auto_fixable, 1):
             fname = Path(iss.file_path).name
             lines.append(f"  {idx}. [{iss.risk_level}] `{iss.function_name}` in {fname}:{iss.line_number}")
@@ -533,50 +568,93 @@ def format_pre_install_report(report: PreInstallRepairReport) -> str:
             lines.append(f"\n--- {fp} ---")
             lines.append(diff.strip())
 
+    # Section 4: NEEDS YOU box (R6)
+    needs_you_items = manual_required + review_required
+    if needs_you_items:
+        lines.append("\n" + "=" * 70)
+        lines.append("  NEEDS YOU: SITES REQUIRING HUMAN ACTION OR CONFIRMATION")
+        lines.append("=" * 70)
+        for idx, iss in enumerate(needs_you_items, 1):
+            fname = Path(iss.file_path).name
+            loc = f"{fname}:{iss.line_number}"
+            lines.append(f"  {idx}. [{iss.fix_status.upper()}] `{iss.function_name}` at {loc}")
+            lines.append(f"     Expression: {iss.call_expression}")
+            if iss.fix_status == "manual":
+                lines.append(f"     Suggested replacement: # {iss.call_expression}  # replace with local implementation or remove")
+            else:
+                lines.append(f"     Action: Review dynamic call or parameter structure")
+            lines.append("")
+        lines.append("=" * 70)
+
     lines.append(border)
     return "\n".join(lines)
 
 
-def apply_fixes(report: PreInstallRepairReport, create_backup: bool = True) -> list[str]:
-    """Apply generated patches to files on disk.
+def apply_fixes(
+    report: PreInstallRepairReport,
+    create_backup: bool = True,
+    project_root: Optional[Union[str, Path]] = None,
+) -> list[str]:
+    """Apply generated patches to files on disk with R4 safety guarantees.
 
-    Args:
-        report: The PreInstallRepairReport containing patched file contents.
-        create_backup: Whether to create a `.bak` copy of files before modifying.
-
-    Returns:
-        list[str]: Paths of modified files.
+    Creates snapshot before editing, validates via ast.parse, and rolls back on failure.
     """
+    if not report.patched_files:
+        report.applied = True
+        return []
+
+    files_to_edit = [Path(fp).resolve() for fp in report.patched_files.keys()]
+    proj_root = Path(project_root).resolve() if project_root else (Path(report.project_root).resolve() if report.project_root else _determine_project_root(files_to_edit[0]))
+
+    # R4: Snapshot before applying
+    snap = create_snapshot(proj_root, files_to_edit, label="pre-repair")
+    report.snapshot_id = snap.snapshot_id
+    report.project_root = str(proj_root)
+
     modified_files: list[str] = []
+    syntax_error_occurred = False
 
-    for file_path, new_content in report.patched_files.items():
-        p = Path(file_path)
-        if not p.is_file():
-            continue
+    try:
+        for file_path, new_content in report.patched_files.items():
+            p = Path(file_path)
+            if not p.is_file():
+                continue
+            if create_backup:
+                backup_path = p.with_suffix(p.suffix + ".bak")
+                shutil.copy2(p, backup_path)
 
-        if create_backup:
-            backup_path = p.with_suffix(p.suffix + ".bak")
-            shutil.copy2(p, backup_path)
+            p.write_text(new_content, encoding="utf-8")
+            modified_files.append(str(p))
 
-        p.write_text(new_content, encoding="utf-8")
-        modified_files.append(str(p))
+            # Verify with ast.parse
+            try:
+                ast.parse(new_content)
+            except SyntaxError as syn_err:
+                syntax_error_occurred = True
+                print(f"\n[ERROR] SyntaxError in patched file {file_path}: {syn_err}", file=sys.stderr)
+                break
+
+        if syntax_error_occurred:
+            print(f"[RECOVERY] Rolling back all changes using snapshot '{snap.snapshot_id}'...", file=sys.stderr)
+            restore_snapshot(proj_root, snap.snapshot_id)
+            report.applied = False
+            return []
+
+    except Exception as exc:
+        print(f"[RECOVERY] Exception during apply, rolling back: {exc}", file=sys.stderr)
+        restore_snapshot(proj_root, snap.snapshot_id)
+        report.applied = False
+        return []
 
     report.applied = True
     return modified_files
 
 
-def install_new_library(new_library_spec: str) -> bool:
-    """Execute `pip install <new_library_spec>` using subprocess.
-
-    Returns:
-        bool: True if installation succeeded (exit code 0), False otherwise.
-    """
-    cmd = [sys.executable, "-m", "pip", "install", new_library_spec]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        return res.returncode == 0
-    except Exception:
-        return False
+def install_new_library(new_library_spec: str, python: Optional[str] = None) -> bool:
+    """Execute library installation into the target python environment."""
+    py_exe = python or sys.executable
+    res = install_library(py_exe, new_library_spec)
+    return res.success
 
 
 def run_pre_install_repair(
@@ -589,29 +667,11 @@ def run_pre_install_repair(
     interactive: bool = False,
     is_demo_case_1: bool = False,
     library_name: Optional[str] = None,
+    project_root: Optional[Union[str, Path]] = None,
+    dry_run: bool = False,
+    python: Optional[str] = None,
 ) -> PreInstallRepairReport:
-    """Orchestrate the complete Pre-Install Repair workflow.
-
-    1. Analyzes issues using api_diff, call_graph, and risk_ranker.
-    2. Generates patches for syntactical/signature changes with DeepSeek API.
-    3. Prints the comprehensive Pre-Install Repair Report.
-    4. Handles user options:
-       - 'apply_and_install' / '1': Apply fixes and install the new library
-       - 'apply_only' / '2': Apply fixes only
-       - 'report_only' / '3': Only show report
-
-    Args:
-        old_path: Path to old library version.
-        new_path: Path to new library version.
-        client_path: Path to client application codebase.
-        action: 'apply_and_install', 'apply_only', 'report_only', or None.
-        api_key: Optional DeepSeek API key (or uses DEEPSEEK_API_KEY env).
-        install_target: Library spec or path to pass to pip install (defaults to str(new_path)).
-        interactive: If True and action is None, prompt user via stdin.
-
-    Returns:
-        PreInstallRepairReport: Completed repair report.
-    """
+    """Orchestrate the complete Pre-Install Repair workflow."""
     # 1. Run analysis and patch generation
     report = analyze_pre_install_issues(
         old_path=old_path,
@@ -619,6 +679,7 @@ def run_pre_install_repair(
         client_path=client_path,
         api_key=api_key,
         library_name=library_name,
+        project_root=project_root,
     )
 
     # 2. Display the clear report
@@ -631,20 +692,8 @@ def run_pre_install_repair(
 
     # 3. Determine action
     chosen_action = action
-    if is_demo_case_1 and (chosen_action is None or interactive or chosen_action == "interactive"):
-        try:
-            choice = input("\nEnter choice [1-4] (default: 1): ").strip()
-            if choice == "2":
-                chosen_action = "apply_only"
-            elif choice == "3":
-                chosen_action = "apply_and_install"
-            elif choice == "4":
-                print("\nExiting.")
-                return report
-            else:
-                chosen_action = "preview"
-        except (EOFError, KeyboardInterrupt):
-            chosen_action = "preview"
+    if dry_run:
+        chosen_action = "preview"
     elif chosen_action is None and interactive:
         print("\nPre-Install Repair Actions:")
         print("  [1] Apply fixes and install the new library")
@@ -661,17 +710,15 @@ def run_pre_install_repair(
         except (EOFError, KeyboardInterrupt):
             chosen_action = "report_only"
 
-    # Default to report_only if no action specified
     if not chosen_action:
         chosen_action = "report_only"
 
-    # 4. Execute selected option
     target_spec = install_target or str(new_path)
 
     if chosen_action == "preview":
         if report.unified_diffs:
             print("\n" + "=" * 70)
-            print("PREVIEW GENERATED PATCHES:")
+            print("PREVIEW GENERATED PATCHES (DRY RUN):")
             print("=" * 70)
             for fp, diff in report.unified_diffs.items():
                 print(f"--- {fp} ---")
@@ -683,13 +730,18 @@ def run_pre_install_repair(
 
     if chosen_action in ("apply_and_install", "1"):
         print("\n[>>] Applying fixes to client codebase...")
-        applied = apply_fixes(report)
-        print(f"Applied fixes to {len(applied)} file(s):")
-        for f in applied:
-            print(f"  * {f} (backup created)")
+        applied = apply_fixes(report, create_backup=create_bak, project_root=project_root)
+        print(f"Applied fixes to {len(applied)} file(s).")
+        if report.snapshot_id and report.project_root:
+            print(f"Snapshot ID: {report.snapshot_id}")
+            print(f"Restore command: python main.py snapshots restore --project {report.project_root} --id {report.snapshot_id}")
 
-        print(f"\n[>>] Installing new library: {target_spec} ...")
-        success = install_new_library(target_spec)
+        # Post-apply re-scan
+        _run_post_apply_rescan(client_path, old_path, new_path, library_name)
+
+        target_python = python or sys.executable
+        print(f"\n[>>] Installing new library: {target_spec} using {target_python} ...")
+        success = install_new_library(target_spec, python=target_python)
         report.installed = success
         if success:
             print("[OK] Library installed successfully!")
@@ -698,12 +750,42 @@ def run_pre_install_repair(
 
     elif chosen_action in ("apply_only", "2"):
         print("\n[>>] Applying fixes only (skipping library installation)...")
-        applied = apply_fixes(report)
-        print(f"Applied fixes to {len(applied)} file(s):")
-        for f in applied:
-            print(f"  * {f} (backup created)")
+        # For CLI usage, create_backup=False as snapshots supersede .bak; for programmatic callers create_backup is controlled by argument
+        create_bak = False if project_root or getattr(report, "snapshot_id", None) else True
+        applied = apply_fixes(report, create_backup=create_bak, project_root=project_root)
+        print(f"Applied fixes to {len(applied)} file(s).")
+        if report.snapshot_id and report.project_root:
+            print(f"Snapshot ID: {report.snapshot_id}")
+            print(f"Restore command: python main.py snapshots restore --project {report.project_root} --id {report.snapshot_id}")
+
+        # Post-apply re-scan
+        _run_post_apply_rescan(client_path, old_path, new_path, library_name)
 
     else:
         print("\n[OK] Report only mode completed. No files were modified.")
 
     return report
+
+
+def _run_post_apply_rescan(
+    client_path: Union[str, Path],
+    old_path: Union[str, Path],
+    new_path: Union[str, Path],
+    library_name: Optional[str],
+) -> None:
+    """Run Phase 4 analysis on the patched client and print summary of remaining sites."""
+    try:
+        diff_res = get_breaking_changes(old_path, new_path)
+        remaining = get_affected_call_sites(client_path, diff_res, library_name=library_name)
+        print(f"\n[RE-SCAN AFTER PATCHING]")
+        print(f"  * Call sites still breaking: {len(remaining)}")
+        for idx, site in enumerate(remaining, 1):
+            fn = site.get("callee_name") or site.get("function_name", "unknown")
+            fp = Path(site.get("file_path", "")).name
+            ln = site.get("line_number", 0)
+            compat = site.get("compatibility", "breaks")
+            is_rem = site.get("is_removal", False)
+            cat = "manual" if is_rem else ("review" if compat == "uncertain" else "auto")
+            print(f"    {idx}. {fn} in {fp}:{ln} [{cat}]")
+    except Exception as exc:
+        print(f"[RE-SCAN] Notice: Could not run post-apply re-scan: {exc}")

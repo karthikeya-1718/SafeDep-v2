@@ -77,6 +77,8 @@ class CallSite:
     is_from_library: bool = True
     compatibility: str = "breaks"
     is_removal: bool = False
+    pos_arg_names: list[Optional[str]] = field(default_factory=list)
+    caller_param_names: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert call site to a dictionary with required fields."""
@@ -104,6 +106,8 @@ class CallSite:
             "is_from_library": self.is_from_library,
             "compatibility": self.compatibility,
             "is_removal": self.is_removal,
+            "pos_arg_names": list(self.pos_arg_names),
+            "caller_param_names": list(self.caller_param_names),
         }
 
 
@@ -150,6 +154,8 @@ class CallGraphVisitor(ast.NodeVisitor):
         self.local_definitions: set[str] = set()
         # Collected call sites in this file
         self.call_sites: list[CallSite] = []
+        # Scope parameter stack: list of parameter name lists for current enclosing function
+        self.param_stack: list[list[str]] = []
 
     def visit_Import(self, node: ast.Import) -> None:
         """Track import aliases, e.g. `import mypkg as mp`."""
@@ -176,14 +182,20 @@ class CallGraphVisitor(ast.NodeVisitor):
         """Track entering and leaving a function definition."""
         self.local_definitions.add(node.name)
         self.scope_stack.append(node.name)
+        params = [a.arg for a in (node.args.posonlyargs + node.args.args + node.args.kwonlyargs)]
+        self.param_stack.append(params)
         self.generic_visit(node)
+        self.param_stack.pop()
         self.scope_stack.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Track entering and leaving an async function definition."""
         self.local_definitions.add(node.name)
         self.scope_stack.append(node.name)
+        params = [a.arg for a in (node.args.posonlyargs + node.args.args + node.args.kwonlyargs)]
+        self.param_stack.append(params)
         self.generic_visit(node)
+        self.param_stack.pop()
         self.scope_stack.pop()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -263,6 +275,8 @@ class CallGraphVisitor(ast.NodeVisitor):
         kw_names = [kw.arg for kw in node.keywords if kw.arg is not None]
         has_varargs = any(isinstance(a, ast.Starred) for a in node.args)
         has_varkwargs = any(kw.arg is None for kw in node.keywords)
+        pos_arg_names = [a.id if isinstance(a, ast.Name) else None for a in node.args]
+        caller_param_names = list(self.param_stack[-1]) if self.param_stack else []
 
         site = CallSite(
             file_path=self.file_path,
@@ -279,6 +293,8 @@ class CallGraphVisitor(ast.NodeVisitor):
             has_varargs=has_varargs,
             has_varkwargs=has_varkwargs,
             is_from_library=is_from_lib,
+            pos_arg_names=pos_arg_names,
+            caller_param_names=caller_param_names,
         )
         self.call_sites.append(site)
         self.generic_visit(node)

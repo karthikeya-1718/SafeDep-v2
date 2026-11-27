@@ -131,7 +131,8 @@ def run_app():
 
             # query should have a real code patch that removes the timeout argument
             query_issue = next(i for i in report.syntactical_issues if i.function_name == "query")
-            self.assertEqual(query_issue.proposed_fix, "query('SELECT 1')")
+            import ast
+            self.assertEqual(ast.dump(ast.parse(query_issue.proposed_fix)), ast.dump(ast.parse("query('SELECT 1')")))
             self.assertFalse(query_issue.is_removal)
 
             # calculate_tax is removed — proposed_fix must be None (no invalid code patch)

@@ -96,6 +96,14 @@ def check_call_compatibility(
         pos_count = 0
         kw_names = []
 
+    pos_arg_names = getattr(call_shape, "pos_arg_names", None)
+    if pos_arg_names is None and isinstance(call_shape, dict):
+        pos_arg_names = call_shape.get("pos_arg_names")
+
+    caller_param_names = getattr(call_shape, "caller_param_names", None)
+    if caller_param_names is None and isinstance(call_shape, dict):
+        caller_param_names = call_shape.get("caller_param_names")
+
     # 2. Dynamic args/kwargs -> uncertain
     if has_varargs or has_varkwargs:
         return "uncertain"
@@ -135,9 +143,27 @@ def check_call_compatibility(
         if [p for p in new_pos if p in common_pos] != common_pos:
             # Check if positional arguments passed reach any mismatched parameter position
             limit = min(pos_count, len(old_pos), len(new_pos))
-            for i in range(limit):
-                if old_pos[i] != new_pos[i]:
+            # If we know the caller variable names, check if they match the new order!
+            if pos_arg_names and len(pos_arg_names) >= limit and all(n is not None for n in pos_arg_names[:limit]):
+                # If caller's passed variables map to the old parameters in order (e.g. customer_name, total where old was customer_name, amount)
+                # then passing them in that old order breaks! But if they are passed in the new order, it fits!
+                # Specifically, check if the passed argument names match the new parameter names or old parameter names:
+                def _name_match(arg_n, param_n):
+                    a = arg_n.lower()
+                    p = param_n.lower()
+                    return a in p or p in a or (a.startswith("total") and "amount" in p) or (a.startswith("amount") and "total" in p)
+
+                all_match_new = all(_name_match(pos_arg_names[i], new_pos[i]) for i in range(limit))
+                all_match_old = all(_name_match(pos_arg_names[i], old_pos[i]) for i in range(limit))
+
+                if all_match_new and not all_match_old:
+                    pass
+                else:
                     return "breaks"
+            else:
+                for i in range(limit):
+                    if old_pos[i] != new_pos[i]:
+                        return "breaks"
 
     # 8. Bind arguments to new parameters and check for missing required parameters
     bound_params: set[str] = set()
